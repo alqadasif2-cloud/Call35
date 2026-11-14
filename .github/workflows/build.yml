@@ -190,6 +190,10 @@ jobs:
               pathlib.Path(target).write_bytes(content)
           print("اكتمل تجهيز google-services.json بنجاح للحزمتين app.backup.source و app.backup.viewer.")
           PY
+      - name: Ensure Gradle Wrapper Executable
+        run: |
+          chmod +x ./gradlew
+          yes | sdkmanager --licenses 2>/dev/null || true
       - name: Assemble APKs
         run: ./gradlew :backup-app:assembleDebug :viewer-app:assembleDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
