@@ -24,6 +24,29 @@ data class AssembledIncomingSms(
     val timestampMs: Long,
 )
 
+data class SmsPduPart(
+    val address: String,
+    val body: String,
+    val timestampMs: Long,
+)
+
+object SmsPduAssembler {
+    fun assemble(parts: List<SmsPduPart>, fallbackNowMs: Long = System.currentTimeMillis()): List<AssembledIncomingSms> {
+        if (parts.isEmpty()) return emptyList()
+        val assembled = LinkedHashMap<String, Pair<Long, StringBuilder>>()
+        for (part in parts) {
+            val addr = part.address.trim()
+            if (addr.isEmpty()) continue
+            val ts = part.timestampMs.takeIf { it > 0L } ?: fallbackNowMs
+            val entry = assembled.getOrPut(addr) { ts to StringBuilder() }
+            entry.second.append(part.body)
+        }
+        return assembled.map { (addr, pair) ->
+            AssembledIncomingSms(address = addr, body = pair.second.toString(), timestampMs = pair.first)
+        }
+    }
+}
+
 /**
  * يلتقط الرسائل النصية الواردة فور وصول بث النظام [Telephony.Sms.Intents.SMS_RECEIVED_ACTION]
  * حتى عندما يكون التطبيق مغلقًا تمامًا، ويجمع أجزاء الرسائل الطويلة في رسالة واحدة بتوقيتها الأصلي.
@@ -37,20 +60,16 @@ class SmsBroadcastReceiver : BroadcastReceiver() {
             .orEmpty()
         if (messages.isEmpty()) return
 
-        val assembled = LinkedHashMap<String, Pair<Long, StringBuilder>>()
-        for (part in messages) {
-            val addr = (part.displayOriginatingAddress ?: part.originatingAddress).orEmpty().trim()
-            if (addr.isEmpty()) continue
-            val textPart = part.displayMessageBody ?: part.messageBody ?: ""
-            val ts = part.timestampMillis.takeIf { it > 0L } ?: System.currentTimeMillis()
-            val entry = assembled.getOrPut(addr) { ts to StringBuilder() }
-            entry.second.append(textPart)
-        }
-        if (assembled.isEmpty()) return
-
-        val items = assembled.map { (addr, pair) ->
-            AssembledIncomingSms(address = addr, body = pair.second.toString(), timestampMs = pair.first)
-        }
+        val items = SmsPduAssembler.assemble(
+            messages.map { part ->
+                SmsPduPart(
+                    address = (part.displayOriginatingAddress ?: part.originatingAddress).orEmpty(),
+                    body = part.displayMessageBody ?: part.messageBody ?: "",
+                    timestampMs = part.timestampMillis,
+                )
+            }
+        )
+        if (items.isEmpty()) return
 
         val appCtx = context.applicationContext
         val pendingResult = goAsync()

@@ -86,7 +86,10 @@ object Prefs {
         lastScanAt.value = sp.getLong("lastScan", 0L)
         onboardingDone.value = sp.getBoolean("onboarded", false)
         deviceName.value = sp.getString("deviceName", null) ?: "${Build.MANUFACTURER} ${Build.MODEL}"
-        quickClipNotifEnabled.value = sp.getBoolean("quickClipNotif", false)
+        quickClipNotifEnabled.value = sp.getBoolean(
+            "quickClipNotif",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+        )
 
         val errSummary = sp.getString("lastErrSummary", null)
         val errFix = sp.getString("lastErrFix", null)

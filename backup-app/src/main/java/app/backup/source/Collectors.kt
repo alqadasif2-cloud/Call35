@@ -4,12 +4,15 @@ import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.IBinder
 import android.provider.CallLog
 import android.provider.Telephony
 import androidx.core.app.NotificationCompat
@@ -294,7 +297,7 @@ object SmsCollector {
         }
 }
 
-enum class ClipResult { SAVED, DUPLICATE, SENSITIVE, EMPTY, TOO_LONG, DISABLED }
+enum class ClipResult { SAVED, DUPLICATE, SENSITIVE, EMPTY, TOO_LONG, DISABLED, UNAUTHENTICATED }
 
 object ClipSaver {
     fun validateAndBuild(
@@ -316,7 +319,8 @@ object ClipSaver {
         val appCtx = ctx.applicationContext
         Prefs.ensureInit(appCtx)
         val uid = Engine.activeUidOrEmpty(appCtx)
-        val deviceId = Prefs.deviceIdForUser(uid.ifBlank { null })
+        if (uid.isBlank()) return ClipResult.UNAUTHENTICATED
+        val deviceId = Prefs.deviceIdForUser(uid)
         val (status, rec) = validateAndBuild(deviceId, Prefs.enabled.value, text)
         if (rec == null) return status
 
@@ -334,17 +338,27 @@ object ClipSaver {
 
     fun readCurrentClipboardText(ctx: Context): String? {
         val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return null
+        val desc = runCatching { cm.primaryClipDescription }.getOrNull()
+        if (desc != null && isMarkedSensitive(desc)) return null
         val clip = runCatching { cm.primaryClip }.getOrNull() ?: return null
         if (clip.itemCount <= 0) return null
-        val desc = clip.description
-        if (desc != null && isMarkedSensitiveOnApi33(desc)) return null
         return clip.getItemAt(0)?.coerceToText(ctx)?.toString()
     }
 
-    private fun isMarkedSensitiveOnApi33(desc: ClipDescription): Boolean {
+    fun isMarkedSensitive(desc: ClipDescription): Boolean {
         val extras = desc.extras ?: return false
         return extras.getBoolean("android.content.extra.IS_SENSITIVE", false)
     }
+}
+
+object ClipboardPolicy {
+    /**
+     * يوضح بدقة ما إذا كان نظام أندرويد يسمح بقراءة الحافظة تلقائيًا من الخلفية:
+     * - أندرويد 8.0–9 (API 26–28): مسموح رسميًا.
+     * - أندرويد 10+ (API 29+): محظور نظاميًا لغير تطبيقات النظام/لوحة المفاتيح.
+     */
+    fun canAutoReadInBackground(sdkInt: Int = Build.VERSION.SDK_INT): Boolean =
+        sdkInt < Build.VERSION_CODES.Q
 }
 
 /**
@@ -381,7 +395,7 @@ object ClipboardAutoMonitor {
 
     private fun onClipboardEvent(appCtx: Context, cm: ClipboardManager, fromWindowFocus: Boolean) {
         Prefs.ensureInit(appCtx)
-        if (!Prefs.onboardingDone.value) return
+        if (!Prefs.onboardingDone.value || Prefs.paused.value) return
         if (RecordType.CLIP.id !in Prefs.enabled.value) return
         if (Engine.activeUidOrEmpty(appCtx).isBlank()) return
 
@@ -389,16 +403,17 @@ object ClipboardAutoMonitor {
         if (!hasClip) return
 
         val desc = runCatching { cm.primaryClipDescription }.getOrNull()
+        if (desc != null && ClipSaver.isMarkedSensitive(desc)) return
         val descTs = desc?.timestamp ?: 0L
         if (fromWindowFocus && descTs > 0L && descTs == Prefs.lastCheckedClipTimestamp) {
             return
         }
 
         val text = ClipSaver.readCurrentClipboardText(appCtx)?.trim().orEmpty()
-        if (text.isEmpty()) return
         if (descTs > 0L) {
             Prefs.lastCheckedClipTimestamp = descTs
         }
+        if (text.isEmpty()) return
 
         val hash = Crypto.sha256Hex(text).take(40)
         if (hash == Prefs.lastCapturedClipHash) return
@@ -414,6 +429,7 @@ object NotificationChannels {
     const val QUICK_CLIP_CHANNEL_ID = "backup_quick_clip"
     const val SYNC_NOTIFICATION_ID = 4101
     const val QUICK_CLIP_NOTIFICATION_ID = 4102
+    const val LEGACY_CLIP_NOTIFICATION_ID = 4103
 
     fun ensureCreated(ctx: Context) {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
@@ -430,11 +446,82 @@ object NotificationChannels {
             "الحفظ السريع للحافظة",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "إشعار اختياري هادئ يتيح حفظ النص المنسوخ بضغطة واحدة على أندرويد 10+"
+            description = "إشعار هادئ لحفظ النص المنسوخ بضغطة واحدة أو مراقبة الحافظة على أندرويد 8–9"
             setShowBadge(false)
         }
         nm.createNotificationChannel(syncChannel)
         nm.createNotificationChannel(clipChannel)
+    }
+}
+
+/**
+ * خدمة أمامية خفيفة تُستخدم **فقط** على Android 8.0–9 (API 26–28) عندما يكون نسخ الحافظة مفعّلًا،
+ * لإبقاء مستمع الحافظة [ClipboardAutoMonitor] نشطًا في الخلفية بشكل رسمي، ولا تُشغَّل أبدًا على Android 10+.
+ */
+class ClipboardLegacyService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Prefs.ensureInit(this)
+        if (
+            !ClipboardPolicy.canAutoReadInBackground() ||
+            !Prefs.onboardingDone.value ||
+            Prefs.paused.value ||
+            RecordType.CLIP.id !in Prefs.enabled.value ||
+            Engine.activeUidOrEmpty(this).isBlank()
+        ) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        NotificationChannels.ensureCreated(this)
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            this.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val openPending = PendingIntent.getActivity(this, 203, openIntent, piFlags)
+
+        val notification = NotificationCompat.Builder(this, NotificationChannels.QUICK_CLIP_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setContentTitle("المراقبة التلقائية للحافظة نشطة")
+            .setContentText("يلتقط النصوص المنسوخة تلقائيًا في الخلفية (أندرويد 8–9)")
+            .setContentIntent(openPending)
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NotificationChannels.LEGACY_CLIP_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(NotificationChannels.LEGACY_CLIP_NOTIFICATION_ID, notification)
+        }
+
+        ClipboardAutoMonitor.register(this)
+        return START_STICKY
+    }
+
+    companion object {
+        fun sync(ctx: Context) {
+            val appCtx = ctx.applicationContext
+            Prefs.ensureInit(appCtx)
+            val intent = Intent(appCtx, ClipboardLegacyService::class.java)
+            val shouldRun = ClipboardPolicy.canAutoReadInBackground() &&
+                Prefs.onboardingDone.value &&
+                !Prefs.paused.value &&
+                RecordType.CLIP.id in Prefs.enabled.value &&
+                Engine.activeUidOrEmpty(appCtx).isNotBlank()
+
+            if (shouldRun) {
+                runCatching { ContextCompat.startForegroundService(appCtx, intent) }
+            } else {
+                runCatching { appCtx.stopService(intent) }
+            }
+        }
     }
 }
 
@@ -453,11 +540,13 @@ object QuickClipNotification {
         Prefs.ensureInit(appCtx)
         NotificationChannels.ensureCreated(appCtx)
         val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val shouldShow = Prefs.onboardingDone.value &&
+        val shouldShow = !ClipboardPolicy.canAutoReadInBackground() &&
+            Prefs.onboardingDone.value &&
             !Prefs.paused.value &&
             RecordType.CLIP.id in Prefs.enabled.value &&
             Prefs.quickClipNotifEnabled.value &&
-            canPostNotifications(appCtx)
+            canPostNotifications(appCtx) &&
+            Engine.activeUidOrEmpty(appCtx).isNotBlank()
 
         if (!shouldShow) {
             nm.cancel(NotificationChannels.QUICK_CLIP_NOTIFICATION_ID)

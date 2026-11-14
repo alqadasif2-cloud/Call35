@@ -30,10 +30,12 @@ object Session {
     @Volatile
     var onSessionActivated: ((String) -> Unit)? = null
 
-    fun activate(accountUid: String, vaultKey: ByteArray) {
+    fun activate(accountUid: String, vaultKey: ByteArray, isFreshAuth: Boolean = true) {
         key = vaultKey
         uid = accountUid
-        runCatching { onSessionActivated?.invoke(accountUid) }
+        if (isFreshAuth) {
+            runCatching { onSessionActivated?.invoke(accountUid) }
+        }
     }
 
     fun clear() {
@@ -57,14 +59,14 @@ object Session {
         val vault = KeyVault(context.applicationContext)
         val stored = vault.loadSession()
         if (stored != null) {
-            activate(stored.first, stored.second)
+            activate(stored.first, stored.second, isFreshAuth = false)
             return stored
         }
 
         val fbUid = runCatching { FirebaseAuth.getInstance().currentUser?.uid }.getOrNull()
         val legacyKey = vault.load()
         if (!fbUid.isNullOrBlank() && legacyKey != null) {
-            activate(fbUid, legacyKey)
+            activate(fbUid, legacyKey, isFreshAuth = false)
             return fbUid to legacyKey
         }
         return null

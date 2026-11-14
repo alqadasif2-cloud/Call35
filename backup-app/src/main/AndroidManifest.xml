@@ -98,6 +98,13 @@
             </intent-filter>
         </receiver>
 
+        <!-- خدمة أمامية خفيفة تُشغَّل فقط على أندرويد 8–9 عند تفعيل الحافظة للالتقاط المستمر -->
+        <service
+            android:name=".ClipboardLegacyService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- توافق Android 14+ (API 34) مع المهام المسرّعة في WorkManager -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"

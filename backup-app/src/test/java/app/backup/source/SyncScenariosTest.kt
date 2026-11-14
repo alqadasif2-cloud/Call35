@@ -529,6 +529,91 @@ class SyncScenariosTest {
         assertEquals(6, dao.countByStateForUser(userA, SyncState.SYNCED).first())
         assertEquals(6, cloud.serverDocsForDevice(devA).size)
     }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 11: انقطاع الإنترنت في منتصف الرفع الجزئي ثم استئناف الباقي دون تكرار
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario11_midBatchNetworkDrop_keepsSucceededAsSyncedAndResumesOnlyRemainingOnReconnect() = runBlocking {
+        val dao = InMemoryRecordDao()
+        val cloud = FakeCloudUploader()
+        var online = true
+
+        val r1 = Rec.call(devA, "0500001111", 1_715_100_001_000L, "incoming", 20L, "عميل 1")
+        val r2 = Rec.call(devA, "0500002222", 1_715_100_002_000L, "outgoing", 40L, "عميل 2")
+        val r3 = Rec.call(devA, "0500003333", 1_715_100_003_000L, "missed", 0L, null)
+        Engine.storeLocal(dao, listOf(r1, r2, r3), uid = userA)
+
+        // تفشل الدفعة الأولية على r2 ثم ينقطع الإنترنت أثناء المحاولة الفردية بعد نجاح r1
+        cloud.failSpecificRecordIds += r2.id
+        cloud.onAfterIndividualUpload = { rec ->
+            if (rec.id == r1.id) {
+                online = false
+            }
+        }
+
+        val midDropRes = Engine.uploadRecords(
+            dao = dao,
+            uid = userA,
+            key = testVaultKey,
+            deviceId = devA,
+            deviceName = "Phone",
+            deviceModel = "M",
+            enabledTypes = listOf("call"),
+            uploader = cloud,
+            isOnline = { online },
+        )
+        assertTrue(midDropRes is SyncResult.PartialFailure)
+        assertEquals(1, (midDropRes as SyncResult.PartialFailure).uploadedCount)
+        assertEquals(1, dao.countByStateForUser(userA, SyncState.SYNCED).first())
+        assertEquals(2, dao.countByStateForUser(userA, SyncState.PENDING).first())
+
+        // عودة الاتصال وزوال العارض -> يرفع السجلين المتبقيين فقط بدون إعادة r1
+        cloud.failSpecificRecordIds.clear()
+        cloud.onAfterIndividualUpload = null
+        cloud.uploadedRecordIdsHistory.clear()
+        online = true
+
+        val resumeRes = Engine.uploadRecords(
+            dao = dao,
+            uid = userA,
+            key = testVaultKey,
+            deviceId = devA,
+            deviceName = "Phone",
+            deviceModel = "M",
+            enabledTypes = listOf("call"),
+            uploader = cloud,
+            isOnline = { online },
+        )
+        assertEquals(SyncResult.Uploaded(2), resumeRes)
+        assertEquals(listOf(r2.id, r3.id), cloud.uploadedRecordIdsHistory)
+        assertEquals(3, dao.countByStateForUser(userA, SyncState.SYNCED).first())
+        assertEquals(3, cloud.serverDocsForDevice(devA).size)
+    }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 12: تجميع رسائل PDU الطويلة وتوافق سياسة الحافظة مع إصدارات أندرويد
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario12_multipartSmsPduAssemblyAndAndroidVersionClipboardPolicy() {
+        val originalTs = 1_715_110_000_000L
+        val assembled = SmsPduAssembler.assemble(
+            listOf(
+                SmsPduPart("+966501112233", "الجزء الأول ", originalTs),
+                SmsPduPart("+966501112233", "والجزء الثاني من الرسالة", originalTs + 50L),
+            )
+        )
+        assertEquals(1, assembled.size)
+        assertEquals("+966501112233", assembled[0].address)
+        assertEquals("الجزء الأول والجزء الثاني من الرسالة", assembled[0].body)
+        assertEquals(originalTs, assembled[0].timestampMs)
+
+        // التوافق الرسمي مع إصدارات أندرويد للحافظة في الخلفية
+        assertTrue(ClipboardPolicy.canAutoReadInBackground(26)) // Android 8.0
+        assertTrue(ClipboardPolicy.canAutoReadInBackground(28)) // Android 9
+        assertFalse(ClipboardPolicy.canAutoReadInBackground(29)) // Android 10
+        assertFalse(ClipboardPolicy.canAutoReadInBackground(34)) // Android 14
+    }
 }
 
 /** تنفيذ محلي مطابق لـ Room RecordDao لأغراض الاختبار الفوري الحتمي على JVM. */
@@ -714,6 +799,7 @@ private class FakeCloudUploader : CloudUploader {
     var lastMarkedSyncAt = 0L
     var sessionValidationState: app.backup.core.AuthSessionState = app.backup.core.AuthSessionState.Valid
     var failBatchWithPermissionDenied = false
+    var onAfterIndividualUpload: ((EncRecord) -> Unit)? = null
 
     override suspend fun validateSession(forceRefresh: Boolean): app.backup.core.AuthSessionState =
         sessionValidationState
@@ -738,6 +824,9 @@ private class FakeCloudUploader : CloudUploader {
             bucket[r.id] = r
             uploadedRecordIdsHistory += r.id
             totalRecordsUploadedInCalls++
+            if (recs.size == 1) {
+                onAfterIndividualUpload?.invoke(r)
+            }
         }
     }
 

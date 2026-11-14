@@ -41,6 +41,8 @@ import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -212,6 +214,9 @@ sealed interface SyncResult {
 }
 
 object Engine {
+    private val scanMutex = Mutex()
+    private val uploadMutex = Mutex()
+
     fun activeUidOrEmpty(ctx: Context): String =
         runCatching { Session.ensureLoaded(ctx.applicationContext)?.first.orEmpty() }.getOrDefault("")
 
@@ -334,14 +339,14 @@ object Engine {
     }
 
     /** فحص المزوّدات المسموح بها وحفظ أي مكالمات أو رسائل جديدة فورًا في Room. */
-    suspend fun scan(ctx: Context, dao: RecordDao): Int {
+    suspend fun scan(ctx: Context, dao: RecordDao): Int = scanMutex.withLock {
         val appCtx = ctx.applicationContext
         CloudInit.configure(appCtx)
         Prefs.ensureInit(appCtx)
-        if (!Prefs.onboardingDone.value) return 0
+        if (!Prefs.onboardingDone.value) return@withLock 0
 
         val uid = activeUidOrEmpty(appCtx)
-        if (uid.isBlank()) return 0
+        if (uid.isBlank()) return@withLock 0
         if (Prefs.isPrimaryOwner(uid)) {
             dao.claimLegacyUnownedRecords(uid)
         }
@@ -395,7 +400,7 @@ object Engine {
         }
         Prefs.notice.value = notes.joinToString(" • ").ifEmpty { null }
         Prefs.setLastScan(System.currentTimeMillis())
-        return added
+        return@withLock added
     }
 
     /**
@@ -594,6 +599,7 @@ object Engine {
                         } catch (e: CancellationException) {
                             throw e
                         } catch (itemErr: Exception) {
+                            if (!isOnline()) break
                             val (summary, fix) = SyncErrorClassifier.classify(itemErr)
                             lastFailure = summary to fix
                             dao.markFailed(listOf(row.id), summary)
@@ -642,20 +648,20 @@ object Engine {
     }
 
     /** نقطة الدخول الرسمية للرفع في بيئة أندرويد. */
-    suspend fun upload(ctx: Context, dao: RecordDao): SyncResult {
+    suspend fun upload(ctx: Context, dao: RecordDao): SyncResult = uploadMutex.withLock {
         val appCtx = ctx.applicationContext
         CloudInit.configure(appCtx)
         Prefs.ensureInit(appCtx)
-        if (Prefs.paused.value) return SyncResult.Paused
+        if (Prefs.paused.value) return@withLock SyncResult.Paused
 
-        val (activeUid, key) = Session.ensureLoaded(appCtx) ?: return SyncResult.NeedsLogin
+        val (activeUid, key) = Session.ensureLoaded(appCtx) ?: return@withLock SyncResult.NeedsLogin
         if (Prefs.isPrimaryOwner(activeUid)) {
             dao.claimLegacyUnownedRecords(activeUid)
         }
         val deviceId = Prefs.deviceIdForUser(activeUid)
         val uploader = FirestoreCloudUploader(CloudRepo(explicitUid = activeUid))
 
-        return uploadRecords(
+        return@withLock uploadRecords(
             dao = dao,
             uid = activeUid,
             key = key,
@@ -856,6 +862,7 @@ object Scheduler {
             wm.cancelUniqueWork(WORK_PERIODIC)
             wm.cancelUniqueWork(WORK_CONTENT_TRIGGER)
             QuickClipNotification.sync(appCtx)
+            ClipboardLegacyService.sync(appCtx)
             return
         }
 
@@ -873,6 +880,7 @@ object Scheduler {
         }
 
         QuickClipNotification.sync(appCtx)
+        ClipboardLegacyService.sync(appCtx)
     }
 
     /** تحديث مراقب ContentUri عند تغيير الأنواع المفعّلة من الواجهة. */
@@ -906,16 +914,23 @@ object Scheduler {
         Prefs.ensureInit(appCtx)
         if (Prefs.paused.value) return
 
+        val isOnlineNow = Net.isOnline(appCtx)
         val builder = OneTimeWorkRequestBuilder<UploadWorker>()
             .setConstraints(connectedConstraint)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
 
-        if (expedited && Net.isOnline(appCtx)) {
+        if (expedited && isOnlineNow) {
             builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
         }
 
+        val policy = when {
+            Prefs.syncInFlight.value -> ExistingWorkPolicy.APPEND_OR_REPLACE
+            isOnlineNow -> ExistingWorkPolicy.REPLACE
+            else -> ExistingWorkPolicy.KEEP
+        }
+
         WorkManager.getInstance(appCtx)
-            .enqueueUniqueWork(WORK_UPLOAD_QUEUE, ExistingWorkPolicy.KEEP, builder.build())
+            .enqueueUniqueWork(WORK_UPLOAD_QUEUE, policy, builder.build())
     }
 
     /** فحص محلي فوري يتبعه رفع تلقائي (مثلاً بعد منح الصلاحيات أو اكتمال الإعداد الأول). */
@@ -977,5 +992,6 @@ object Scheduler {
         WorkManager.getInstance(appCtx).cancelAllWork()
         val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
         nm?.cancel(NotificationChannels.QUICK_CLIP_NOTIFICATION_ID)
+        ClipboardLegacyService.sync(appCtx)
     }
 }

@@ -30,14 +30,15 @@ class App : Application() {
         NetworkRestoreMonitor.register(this)
         Scheduler.ensureBackgroundSchedule(this)
 
-        // إعادة محاولة السجلات الفاشلة تلقائيًا فور تجديد الجلسة أو تسجيل الدخول
+        // إعادة محاولة السجلات الفاشلة وتشغيل الجدولة تلقائيًا عند تسجيل دخول جديد
         app.backup.core.Session.onSessionActivated = { uid ->
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                 runCatching {
                     val dao = AppDb.get(this@App).dao()
                     val retried = dao.retryFailedNow(uid)
                     Prefs.clearSyncError()
-                    if (retried > 0) {
+                    Scheduler.ensureBackgroundSchedule(this@App)
+                    if (retried > 0 || dao.pendingOrFailedNowForUser(uid) > 0) {
                         Scheduler.enqueueImmediateUpload(this@App, expedited = true)
                     }
                 }
@@ -112,22 +113,45 @@ object NetworkRestoreMonitor {
     @Volatile
     private var registered = false
 
+    @Volatile
+    private var lastValidated: Boolean = false
+
+    private var triggerJob: Job? = null
+
     fun register(ctx: Context) {
         if (registered) return
         synchronized(this) {
             if (registered) return
             val appCtx = ctx.applicationContext
             val cm = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            lastValidated = app.backup.core.Net.isOnline(appCtx)
             val req = NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .build()
 
             val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: Network) {
+                    if (!app.backup.core.Net.isOnline(appCtx)) {
+                        lastValidated = false
+                    }
+                }
+
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                     val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                         caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                    if (!validated) return
-                    scope.launch {
+                    if (!validated) {
+                        if (!app.backup.core.Net.isOnline(appCtx)) {
+                            lastValidated = false
+                        }
+                        return
+                    }
+                    val transitionedOnline = !lastValidated
+                    lastValidated = true
+                    if (!transitionedOnline) return
+
+                    triggerJob?.cancel()
+                    triggerJob = scope.launch {
+                        delay(800L)
                         Prefs.ensureInit(appCtx)
                         if (!Prefs.onboardingDone.value || Prefs.paused.value) return@launch
                         val uid = Engine.activeUidOrEmpty(appCtx)
@@ -135,7 +159,7 @@ object NetworkRestoreMonitor {
                         val dao = AppDb.get(appCtx).dao()
                         dao.promoteLocalToPending(uid)
                         if (dao.pendingOrFailedNowForUser(uid) > 0) {
-                            Scheduler.enqueueImmediateUpload(appCtx)
+                            Scheduler.enqueueImmediateUpload(appCtx, expedited = true)
                         }
                     }
                 }

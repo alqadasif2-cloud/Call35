@@ -275,14 +275,10 @@ fun Home() {
     var confirm by remember { mutableStateOf<String?>(null) }
     var pendingToggleType by remember { mutableStateOf<RecordType?>(null) }
 
-    // ربط سجلات الإصدار القديم بالحساب الأساسي لمرة واحدة وتأكيد الجدولة الخلفية دون الاعتماد على مؤقت واجهة
+    // ربط سجلات الإصدار القديم بالحساب الأساسي لمرة واحدة وتأكيد الجدولة الخلفية دون إخفاء أي أخطاء مزامنة سابقة
     LaunchedEffect(activeUid) {
         if (activeUid.isNotBlank() && Prefs.isPrimaryOwner(activeUid)) {
-            dao.claimLegacyUnownedRecords(activeUid)
-        }
-        if (activeUid.isNotBlank()) {
-            dao.retryFailedNow(activeUid)
-            Prefs.clearSyncError()
+            dao.claimLegacyUnownedRecords(uid = activeUid)
         }
         Scheduler.ensureBackgroundSchedule(ctx)
         if (!paused && activeUid.isNotBlank()) {
@@ -299,6 +295,7 @@ fun Home() {
                 Scheduler.triggerImmediateScanAndUpload(ctx)
             }
             QuickClipNotification.sync(ctx)
+            ClipboardLegacyService.sync(ctx)
         }
     }
 
@@ -315,6 +312,16 @@ fun Home() {
         }
         Scheduler.refreshContentTriggers(ctx)
         QuickClipNotification.sync(ctx)
+        ClipboardLegacyService.sync(ctx)
+    }
+
+    val secondaryPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        permVersion += 1
+        LiveContentObservers.register(ctx)
+        Scheduler.ensureBackgroundSchedule(ctx)
+        Scheduler.triggerImmediateScanAndUpload(ctx)
     }
 
     val typePermLauncher = rememberLauncherForActivityResult(
@@ -369,6 +376,7 @@ fun Home() {
             Prefs.setEnabled(t.id, false)
             Scheduler.refreshContentTriggers(ctx)
             QuickClipNotification.sync(ctx)
+            ClipboardLegacyService.sync(ctx)
             message = "تم إيقاف التقاط «${typeLabel(t)}» الجديدة. السجلات السابقة محفوظة."
             return
         }
@@ -598,12 +606,23 @@ fun Home() {
                 } else null
                 RecordType.SMS -> if (permOk && !Perms.canReceiveIncomingSms(ctx)) {
                     "مفعّل لقراءة الرسائل (امنح صلاحية استقبال الرسائل للالتقاط اللحظي)"
+                } else if (permOk && !Perms.canReadSmsProvider(ctx)) {
+                    "مفعّل للرسائل الواردة فقط (امنح قراءة الرسائل لأرشفة الصادر والقديم)"
                 } else null
-                RecordType.CLIP -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    "يلتقط تلقائيًا عند فتح النافذة أو عبر قائمة تحديد النص وإشعار الحفظ السريع"
-                } else {
+                RecordType.CLIP -> if (ClipboardPolicy.canAutoReadInBackground()) {
                     "يلتقط النصوص المنسوخة تلقائيًا في الواجهة والخلفية"
+                } else {
+                    "يلتقط تلقائيًا عند فتح النافذة أو عبر قائمة تحديد النص وإشعار الحفظ السريع"
                 }
+            }
+            val missingSecondaryPerm = when (t) {
+                RecordType.CALL -> if (permOk && !Perms.canDetectPhoneState(ctx)) Manifest.permission.READ_PHONE_STATE else null
+                RecordType.SMS -> when {
+                    permOk && !Perms.canReceiveIncomingSms(ctx) -> Manifest.permission.RECEIVE_SMS
+                    permOk && !Perms.canReadSmsProvider(ctx) -> Manifest.permission.READ_SMS
+                    else -> null
+                }
+                RecordType.CLIP -> null
             }
             Row(
                 Modifier
@@ -627,6 +646,13 @@ fun Home() {
                         }
                     } else if (extraDetail != null) {
                         Text(extraDetail, style = MaterialTheme.typography.bodySmall)
+                        if (t.id in enabled && missingSecondaryPerm != null) {
+                            TextButton(onClick = {
+                                secondaryPermLauncher.launch(arrayOf(missingSecondaryPerm))
+                            }) {
+                                Text("منح الصلاحية المكملة")
+                            }
+                        }
                     }
                 }
                 Switch(
@@ -643,16 +669,16 @@ fun Home() {
                 val sdkInfo = "إصدار جهازك الحالي: Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
                 Text(sdkInfo, style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(4.dp))
-                val clipExplanation = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                    "يدعم إصدار أندرويد على جهازك (Android 8–9) التقاط النصوص المنسوخة تلقائيًا في الواجهة والخلفية فور نسخها، مع استبعاد كلمات المرور وأكواد التحقق تلقائيًا."
+                val clipExplanation = if (ClipboardPolicy.canAutoReadInBackground()) {
+                    "يدعم إصدار أندرويد على جهازك (Android 8–9) التقاط النصوص المنسوخة تلقائيًا في الواجهة والخلفية فور نسخها عبر خدمة خفيفة مخصّصة لهذا الإصدار فقط، مع استبعاد كلمات المرور وأكواد التحقق تلقائيًا."
                 } else {
                     "بدءًا من Android 10 فما فوق، يمنع نظام أندرويد جميع التطبيقات رسميًا من قراءة الحافظة بصمت أثناء وجودها في الخلفية لحماية الخصوصية.\n" +
                         "• يلتقط التطبيق النص المنسوخ تلقائيًا فور ظهور نافذته دون الضغط على أي زر.\n" +
-                        "• لحفظ أي نص وأنت داخل تطبيق آخر بضغطة واحدة دون فتح التطبيق: حدّد النص واختر «حفظ في نسخي الاحتياطي»، أو شاركه للتطبيق، أو فعّل «إشعار الحفظ السريع» أدناه."
+                        "• لحفظ أي نص وأنت داخل تطبيق آخر بضغطة واحدة دون فتح التطبيق: حدّد النص واختر «حفظ في نسخي الاحتياطي»، أو شاركه للتطبيق، أو استخدم «إشعار الحفظ السريع» أدناه."
                 }
                 Text(clipExplanation, style = MaterialTheme.typography.bodySmall)
 
-                if (RecordType.CLIP.id in enabled) {
+                if (RecordType.CLIP.id in enabled && !ClipboardPolicy.canAutoReadInBackground()) {
                     Spacer(Modifier.height(10.dp))
                     Row(
                         Modifier.fillMaxWidth(),

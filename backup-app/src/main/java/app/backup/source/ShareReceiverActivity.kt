@@ -38,10 +38,10 @@ class ShareReceiverActivity : ComponentActivity() {
 fun clipMessage(r: ClipResult, ctx: Context? = null): String = when (r) {
     ClipResult.SAVED -> {
         val online = ctx?.let { Net.isOnline(it) } ?: true
-        if (online && !Prefs.paused.value) {
-            "تم حفظ النص محليًا وبدأت مزامنته تلقائيًا مع السحابة"
-        } else {
-            "تم حفظ النص محليًا في قائمة الانتظار وسيُرفع تلقائيًا عند توفر الاتصال"
+        when {
+            Prefs.paused.value -> "تم حفظ النص محليًا فقط لأن المزامنة متوقفة مؤقتًا"
+            online -> "تم حفظ النص محليًا في Room وبدأت مزامنته تلقائيًا إلى السحابة"
+            else -> "تم حفظ النص محليًا في قائمة الانتظار وسيُرفع تلقائيًا عند توفر الإنترنت"
         }
     }
     ClipResult.DUPLICATE -> "هذا النص محفوظ مسبقًا ولن يتكرر"
@@ -49,4 +49,5 @@ fun clipMessage(r: ClipResult, ctx: Context? = null): String = when (r) {
     ClipResult.EMPTY -> "لا يوجد نص صالح لحفظه"
     ClipResult.TOO_LONG -> "النص أطول من الحد المسموح (100 ألف حرف)"
     ClipResult.DISABLED -> "نسخ «الحافظة» غير مفعّل حاليًا في إعدادات التطبيق"
+    ClipResult.UNAUTHENTICATED -> "يرجى تسجيل الدخول في تطبيق «نسخي الاحتياطي» أولًا"
 }
