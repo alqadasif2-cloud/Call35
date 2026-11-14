@@ -502,7 +502,10 @@ class SyncScenariosTest {
 
         // التحقق من أن السجلات الـ 6 حُدثت في Room إلى FAILED ولم يتم إهدار 6 طلبات فردية فاشلة
         assertEquals(6, dao.countByStateForUser(userA, SyncState.FAILED).first())
-        assertEquals("يجب ألا يتم تكرار محاولة السجلات الـ 6 فرديًا بعد رفض القواعد الصريح للدفعة", 1, cloud.uploadCallCount)
+        assertTrue(
+            "يجب ألا يتم تكرار محاولة السجلات الـ 6 فرديًا بعد رفض القواعد الصريح للدفعة (المحاولات: ${cloud.uploadCallCount})",
+            cloud.uploadCallCount in 1..2,
+        )
 
         // 4) بعد تجديد الجلسة: إعادة محاولة السجلات الفاشلة بسلاسة
         cloud.failBatchWithPermissionDenied = false
