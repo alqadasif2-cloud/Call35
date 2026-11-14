@@ -50,11 +50,14 @@ function classifySyncErrorWeb(err: unknown): { summary: string; remediation: str
         'جميع السجلات محفوظة محليًا في قائمة الانتظار، وسيُعاد رفع السجلات غير المتزامنة تلقائيًا فور عودة الاتصال.',
     };
   }
-  if (raw.includes('permission-denied') || raw.includes('insufficient permissions')) {
+  if (
+    raw.includes('permission-denied') ||
+    raw.includes('permission_denied') ||
+    raw.includes('insufficient permissions')
+  ) {
     return {
       summary: 'رفضت قواعد أمان Firebase حفظ الدفعة',
-      remediation:
-        'سجّل الخروج ثم أعد تسجيل الدخول لتجديد جلسة المصادقة، ثم اضغط «إعادة محاولة السجلات الفاشلة فقط».',
+      remediation: `${friendly} إذا استمر الرفض بعد تحديث الجهاز والجلسة، أعد تسجيل الدخول واضغط «إعادة محاولة السجلات الفاشلة فقط».`,
     };
   }
   return {
@@ -187,7 +190,7 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
         }
 
         // 1) التحقق الاستباقي من صلاحية الجلسة وحالة رمز المصادقة
-        const sessionCheck = await CloudRepo.validateSession(false);
+        const sessionCheck = await CloudRepo.validateSession(false, uid);
         if (!sessionCheck.valid) {
           const diag: SyncErrorDiagnostic = {
             summary: 'انتهت صلاحية جلسة المصادقة السحابية',
@@ -206,7 +209,8 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
           activePrefs.deviceId,
           activePrefs.deviceName,
           activePrefs.model,
-          activePrefs.enabled
+          activePrefs.enabled,
+          uid
         );
 
         let uploadedCount = 0;
@@ -242,7 +246,8 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
           try {
             await CloudRepo.uploadBatch(
               activePrefs.deviceId,
-              encryptedPairs.map((p) => p.enc)
+              encryptedPairs.map((p) => p.enc),
+              uid
             );
             await LocalQueueDb.markSynced(
               uid,
@@ -252,17 +257,29 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
           } catch (batchErr) {
             if (!navigator.onLine) break;
             const errStr = String(batchErr).toLowerCase();
-            const isRulesDenied = errStr.includes('permission-denied') || errStr.includes('insufficient permissions');
+            const isRulesDenied =
+              errStr.includes('permission-denied') ||
+              errStr.includes('permission_denied') ||
+              errStr.includes('insufficient permissions');
 
+            let stopGlobalRulesLoop = false;
             if (isRulesDenied) {
-              // محاولة تجديد رمز المصادقة لمرة واحدة وإعادة إرسال الدفعة
+              // محاولة تجديد الجلسة والتحقق من سجل الجهاز ثم إعادة محاولة الدفعة
               let recovered = false;
-              const refreshed = await CloudRepo.validateSession(true);
+              const refreshed = await CloudRepo.validateSession(true, uid);
               if (refreshed.valid) {
                 try {
+                  await CloudRepo.registerOrUpdateDevice(
+                    activePrefs.deviceId,
+                    activePrefs.deviceName,
+                    activePrefs.model,
+                    activePrefs.enabled,
+                    uid
+                  );
                   await CloudRepo.uploadBatch(
                     activePrefs.deviceId,
-                    encryptedPairs.map((p) => p.enc)
+                    encryptedPairs.map((p) => p.enc),
+                    uid
                   );
                   await LocalQueueDb.markSynced(
                     uid,
@@ -276,14 +293,52 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
               }
 
               if (!recovered) {
-                const { summary, remediation } = classifySyncErrorWeb(batchErr);
-                const batchIds = encryptedPairs.map((p) => p.row.id);
-                await LocalQueueDb.markFailed(uid, batchIds, summary);
-                batchIds.forEach((id) => failedSeen.add(id));
-                failedCount += batchIds.length;
-                latestDiag = { summary, remediation, occurredAt: Date.now() };
-                break;
+                if (encryptedPairs.length === 1) {
+                  const { summary, remediation } = classifySyncErrorWeb(batchErr);
+                  await LocalQueueDb.markFailed(uid, [encryptedPairs[0].row.id], summary);
+                  failedSeen.add(encryptedPairs[0].row.id);
+                  failedCount++;
+                  latestDiag = { summary, remediation, occurredAt: Date.now() };
+                  stopGlobalRulesLoop = true;
+                } else {
+                  let batchSingleUploaded = 0;
+                  let consecutiveRules = 0;
+                  for (let idx = 0; idx < encryptedPairs.length; idx++) {
+                    if (!navigator.onLine) break;
+                    const item = encryptedPairs[idx];
+                    try {
+                      await CloudRepo.uploadBatch(activePrefs.deviceId, [item.enc], uid);
+                      await LocalQueueDb.markSynced(uid, [item.row.id]);
+                      uploadedCount++;
+                      batchSingleUploaded++;
+                      consecutiveRules = 0;
+                    } catch (itemErr) {
+                      const { summary, remediation } = classifySyncErrorWeb(itemErr);
+                      await LocalQueueDb.markFailed(uid, [item.row.id], `${summary} (${item.row.id})`);
+                      failedSeen.add(item.row.id);
+                      failedCount++;
+                      latestDiag = { summary, remediation, occurredAt: Date.now() };
+                      const itemStr = String(itemErr).toLowerCase();
+                      const itemIsRules =
+                        itemStr.includes('permission-denied') ||
+                        itemStr.includes('permission_denied') ||
+                        itemStr.includes('insufficient permissions');
+                      consecutiveRules = itemIsRules ? consecutiveRules + 1 : 0;
+                      if (batchSingleUploaded === 0 && consecutiveRules >= 3) {
+                        const restIds = encryptedPairs.slice(idx + 1).map((p) => p.row.id);
+                        if (restIds.length > 0) {
+                          await LocalQueueDb.markFailed(uid, restIds, summary);
+                          restIds.forEach((id) => failedSeen.add(id));
+                          failedCount += restIds.length;
+                        }
+                        stopGlobalRulesLoop = true;
+                        break;
+                      }
+                    }
+                  }
+                }
               }
+              if (stopGlobalRulesLoop) break;
             } else if (encryptedPairs.length === 1) {
               const { summary, remediation } = classifySyncErrorWeb(batchErr);
               await LocalQueueDb.markFailed(uid, [encryptedPairs[0].row.id], summary);
@@ -294,7 +349,7 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
               for (const item of encryptedPairs) {
                 if (!navigator.onLine) break;
                 try {
-                  await CloudRepo.uploadBatch(activePrefs.deviceId, [item.enc]);
+                  await CloudRepo.uploadBatch(activePrefs.deviceId, [item.enc], uid);
                   await LocalQueueDb.markSynced(uid, [item.row.id]);
                   uploadedCount++;
                 } catch (itemErr) {
@@ -312,7 +367,7 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
         let nextLastSyncAt = activePrefs.lastSyncAt;
         if (uploadedCount > 0) {
           const now = Date.now();
-          await CloudRepo.markDeviceSynced(activePrefs.deviceId, now);
+          await CloudRepo.markDeviceSynced(activePrefs.deviceId, now, uid);
           nextLastSyncAt = now;
           onCloudChanged();
         }
@@ -461,7 +516,7 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
     LocalPrefsStore.save(uid, next);
     onUpdatePrefs(next);
     try {
-      await CloudRepo.registerOrUpdateDevice(next.deviceId, next.deviceName, next.model, next.enabled);
+      await CloudRepo.registerOrUpdateDevice(next.deviceId, next.deviceName, next.model, next.enabled, uid);
       onCloudChanged();
       setStatusNotice('تم تحديث اسم الجهاز في السحابة.');
     } catch (err) {
@@ -477,7 +532,7 @@ export const BackupSourceView: React.FC<BackupSourceViewProps> = ({
     LocalPrefsStore.save(uid, next);
     onUpdatePrefs(next);
     try {
-      await CloudRepo.registerOrUpdateDevice(next.deviceId, next.deviceName, next.model, next.enabled);
+      await CloudRepo.registerOrUpdateDevice(next.deviceId, next.deviceName, next.model, next.enabled, uid);
       onCloudChanged();
     } catch {
       // Synced on next run

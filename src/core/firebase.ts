@@ -45,7 +45,7 @@ export const ActiveSessionStore = {
   },
 
   getActiveUid(): string | null {
-    return auth.currentUser?.uid || readStoredSession()?.uid || null;
+    return readStoredSession()?.uid || auth.currentUser?.uid || null;
   },
 
   save(session: AccountSession): void {
@@ -145,13 +145,24 @@ export function bootstrapFirebaseSession(): Promise<SessionBootstrapState> {
 /**
  * Standardized Firestore permission/operation error handler producing structured JSON diagnostics.
  */
+function extractFirebaseCode(error: unknown): string | null {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const c = (error as { code?: unknown }).code;
+    if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+  }
+  return null;
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
   path: string | null
 ): never {
+  const code = extractFirebaseCode(error);
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const enrichedError = code && !rawMessage.includes(code) ? `[${code}] ${rawMessage}` : rawMessage;
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: enrichedError,
     authInfo: {
       userId: ActiveSessionStore.getActiveUid(),
       email: auth.currentUser?.email,
@@ -172,7 +183,7 @@ export function handleFirestoreError(
 }
 
 /**
- * Maps Firebase Auth & Firestore errors to clear Arabic user-facing messages without leaking sensitive payloads.
+ * Maps Firebase Auth & Firestore errors to clear Arabic user-facing messages with exact diagnostic codes/paths.
  */
 export function friendlyErrorMessageAr(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -194,8 +205,13 @@ export function friendlyErrorMessageAr(err: unknown): string {
       if (parsed.error.includes('Quota exceeded')) {
         return 'تم تجاوز حصة الاستخدام اليومية المجانية لقاعدة البيانات السحابية.';
       }
-      if (parsed.error.includes('Missing or insufficient permissions')) {
-        return 'رفضت قواعد الأمان السحابية هذه العملية. تأكد من صلاحية الجلسة وأن البيانات تتبع لحسابك.';
+      if (
+        parsed.error.includes('Missing or insufficient permissions') ||
+        parsed.error.includes('permission-denied') ||
+        parsed.error.includes('PERMISSION_DENIED')
+      ) {
+        const pathNote = parsed.path ? `على المسار ${parsed.path}` : 'على المسار السحابي';
+        return `رفضت قواعد أمان Firebase العملية (${parsed.operationType} ${pathNote} — PERMISSION_DENIED). تأكد من صلاحية الجلسة وأن البيانات تتبع لحسابك.`;
       }
       if (parsed.error.includes('offline') || parsed.error.includes('unavailable')) {
         return 'تعذّر الوصول إلى الخادم السحابي حاليًا. تحقق من اتصال الإنترنت وأعد المحاولة.';
@@ -203,6 +219,14 @@ export function friendlyErrorMessageAr(err: unknown): string {
     } catch {
       // Fall through
     }
+  }
+
+  if (
+    raw.includes('Missing or insufficient permissions') ||
+    raw.includes('permission-denied') ||
+    raw.includes('PERMISSION_DENIED')
+  ) {
+    return 'رفضت قواعد أمان Firebase العملية (PERMISSION_DENIED). تأكد من صلاحية الجلسة ومسار الحفظ.';
   }
 
   if (raw.includes('auth/email-already-in-use') || raw.includes('username-already-in-use')) {

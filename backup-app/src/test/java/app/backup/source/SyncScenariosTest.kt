@@ -503,8 +503,8 @@ class SyncScenariosTest {
         // التحقق من أن السجلات الـ 6 حُدثت في Room إلى FAILED ولم يتم إهدار 6 طلبات فردية فاشلة
         assertEquals(6, dao.countByStateForUser(userA, SyncState.FAILED).first())
         assertTrue(
-            "يجب ألا يتم تكرار محاولة السجلات الـ 6 فرديًا بعد رفض القواعد الصريح للدفعة (المحاولات: ${cloud.uploadCallCount})",
-            cloud.uploadCallCount in 1..2,
+            "يجب ألا يتم تكرار محاولة كل السجلات بعد إثبات الرفض الشامل عبر قاطع الدائرة المبكر (المحاولات: ${cloud.uploadCallCount})",
+            cloud.uploadCallCount in 1..5,
         )
 
         // 4) بعد تجديد الجلسة: إعادة محاولة السجلات الفاشلة بسلاسة
@@ -728,6 +728,62 @@ class SyncScenariosTest {
         assertEquals(1, dao.countByStateForUser(userA, SyncState.FAILED).first())
         assertEquals(2, cloud.serverDocsForDevice(devA).size)
     }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 15: سجل واحد متعارض يسبب PERMISSION_DENIED داخل دفعة -> يُعزل وحده وتُرفع البقية كاملة
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario15_singleRecordPermissionDeniedInBatch_isolatesOnlyConflictingRecordAndUploadsRest() = runBlocking {
+        val dao = InMemoryRecordDao()
+        val cloud = FakeCloudUploader()
+
+        val recs = (1..5).map { i ->
+            Rec.sms(devA, "055111000$i", "رسالة اختبار $i", 1_726_000_000_000L + i * 1000L, "inbox")
+        }
+        val badId = recs[2].id
+        Engine.storeLocal(dao, recs, uid = userA)
+
+        cloud.failSpecificRecordWithPermissionDenied += badId
+
+        val res = Engine.uploadRecords(
+            dao = dao,
+            uid = userA,
+            key = testVaultKey,
+            deviceId = devA,
+            deviceName = "Pixel",
+            deviceModel = "Pixel 8",
+            enabledTypes = listOf("sms"),
+            uploader = cloud,
+            isOnline = { true },
+            transientRetryDelayMs = 1L,
+        )
+
+        assertTrue(res is SyncResult.PartialFailure)
+        val pf = res as SyncResult.PartialFailure
+        assertEquals(4, pf.uploadedCount)
+        assertEquals(1, pf.failedCount)
+        assertEquals(4, dao.countByStateForUser(userA, SyncState.SYNCED).first())
+        assertEquals(1, dao.countByStateForUser(userA, SyncState.FAILED).first())
+        assertEquals(4, cloud.serverDocsForDevice(devA).size)
+    }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 16: الحفاظ على رمز الخطأ الأصلي ونوع العملية والمسار عند تشخيص أخطاء قواعد الأمان
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario16_syncErrorClassifier_preservesFirebaseCodeOperationAndPath() {
+        val err = app.backup.core.CloudRuleException(
+            operation = "uploadBatch",
+            path = "users/$userA/devices/$devA/records",
+            codeName = "PERMISSION_DENIED",
+            detail = "Missing or insufficient permissions.",
+        )
+        val (summary, remediation) = SyncErrorClassifier.classify(err)
+        assertEquals("رفضت قواعد أمان Firebase حفظ الدفعة", summary)
+        assertTrue(remediation.contains("PERMISSION_DENIED"))
+        assertTrue(remediation.contains("uploadBatch"))
+        assertTrue(remediation.contains("users/$userA/devices/$devA/records"))
+    }
 }
 
 /** تنفيذ محلي مطابق لـ Room RecordDao لأغراض الاختبار الفوري الحتمي على JVM. */
@@ -914,6 +970,7 @@ private class InMemoryRecordDao : RecordDao {
 private class FakeCloudUploader : CloudUploader {
     private val serverStore = LinkedHashMap<String, LinkedHashMap<String, EncRecord>>()
     val failSpecificRecordIds = HashSet<String>()
+    val failSpecificRecordWithPermissionDenied = HashSet<String>()
     val uploadedRecordIdsHistory = ArrayList<String>()
     var uploadCallCount = 0
     var totalRecordsUploadedInCalls = 0
@@ -937,6 +994,15 @@ private class FakeCloudUploader : CloudUploader {
             throw com.google.firebase.firestore.FirebaseFirestoreException(
                 "رفضت قواعد أمان Firebase حفظ الدفعة",
                 com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED,
+            )
+        }
+        val deniedMatch = recs.firstOrNull { it.id in failSpecificRecordWithPermissionDenied }
+        if (deniedMatch != null) {
+            throw app.backup.core.CloudRuleException(
+                operation = if (recs.size == 1) "uploadRecord" else "uploadBatch",
+                path = "users/uid/devices/$deviceId/records/${deniedMatch.id}",
+                codeName = "PERMISSION_DENIED",
+                detail = "Missing or insufficient permissions.",
             )
         }
         if (recs.any { it.id in failSpecificRecordIds }) {

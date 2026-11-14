@@ -180,11 +180,11 @@ object Prefs {
         }
 
     fun isUploadFixRecoveryApplied(uid: String): Boolean =
-        uid.isNotBlank() && sp.getBoolean("upload_fix_recovery_v3_$uid", false)
+        uid.isNotBlank() && sp.getBoolean("upload_fix_recovery_v4_$uid", false)
 
     fun markUploadFixRecoveryApplied(uid: String) {
         if (uid.isNotBlank()) {
-            sp.edit().putBoolean("upload_fix_recovery_v3_$uid", true).apply()
+            sp.edit().putBoolean("upload_fix_recovery_v4_$uid", true).apply()
         }
     }
 

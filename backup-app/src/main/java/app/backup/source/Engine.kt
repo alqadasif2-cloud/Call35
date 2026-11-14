@@ -174,9 +174,23 @@ class FirestoreCloudUploader(private val repo: CloudRepo) : CloudUploader {
 }
 
 object SyncErrorClassifier {
+    fun isRulesDeniedError(e: Throwable): Boolean =
+        e is app.backup.core.CloudRuleException ||
+            (e is FirebaseFirestoreException &&
+                (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+                 e.code == FirebaseFirestoreException.Code.UNAUTHENTICATED)) ||
+            e.message?.contains("رفضت قواعد أمان Firebase") == true
+
+    fun recordReason(e: Throwable, baseSummary: String): String = when (e) {
+        is app.backup.core.CloudRuleException -> "$baseSummary [${e.codeName} • ${e.operation} • ${e.path}]"
+        is FirebaseFirestoreException -> "$baseSummary [${e.code.name}]"
+        else -> baseSummary
+    }
+
     fun classify(e: Throwable): Pair<String, String> {
         val fsCode = (e as? FirebaseFirestoreException)?.code?.name
-        val detail = e.message?.trim()?.replace(Regex("\\s+"), " ")?.take(120)
+            ?: (e as? app.backup.core.CloudRuleException)?.codeName
+        val detail = e.message?.trim()?.replace(Regex("\\s+"), " ")?.take(140)
         return when {
             e is TimeoutCancellationException ->
                 "انتهت مهلة الاتصال بالخادم أثناء الرفع" to
@@ -187,11 +201,17 @@ object SyncErrorClassifier {
             e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAVAILABLE ->
                 "الخدمة السحابية غير متاحة مؤقتًا أو الشبكة ضعيفة" to
                     "تبقى السجلات في قائمة الانتظار المحلية وسيُعاد رفعها تلقائيًا بتأخير متزايد."
+            e is app.backup.core.CloudRuleException ->
+                "رفضت قواعد أمان Firebase حفظ الدفعة" to
+                    "الرمز: ${e.codeName} • العملية: ${e.operation} • المسار: ${e.path}. " +
+                    "تحقق من جلسة المصادقة وصلاحية الحساب ثم اضغط «إعادة محاولة السجلات الفاشلة فقط»." +
+                    if (e.detail.isNotBlank()) " (${e.detail.take(80)})" else ""
             (e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) ||
                 e.message?.contains("رفضت قواعد أمان Firebase") == true ->
                 "رفضت قواعد أمان Firebase حفظ الدفعة" to
-                    "تحقق من جلسة المصادقة وصلاحية الحساب ثم اضغط «إعادة محاولة الفاشل»." +
-                        if (!detail.isNullOrBlank()) " ($detail)" else ""
+                    "الرمز: ${fsCode ?: "PERMISSION_DENIED"} — " +
+                    "تحقق من جلسة المصادقة وصلاحية الحساب ثم اضغط «إعادة محاولة السجلات الفاشلة فقط»." +
+                    if (!detail.isNullOrBlank()) " ($detail)" else ""
             e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAUTHENTICATED ->
                 "انتهت صلاحية جلسة المصادقة السحابية" to
                     "افتح التطبيق وأعد تسجيل الدخول بحسابك لاستئناف المزامنة."
@@ -643,17 +663,16 @@ object Engine {
             } catch (batchErr: Exception) {
                 if (!isOnline()) break
 
-                val isRulesDenied = (batchErr is FirebaseFirestoreException &&
-                    (batchErr.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ||
-                     batchErr.code == FirebaseFirestoreException.Code.UNAUTHENTICATED)) ||
-                    batchErr.message.orEmpty().contains("رفضت قواعد أمان Firebase")
+                val isRulesDenied = SyncErrorClassifier.isRulesDeniedError(batchErr)
 
+                var stopGlobalRulesLoop = false
                 if (isRulesDenied) {
                     var recovered = false
                     val refreshResult = runCatching { uploader.validateSession(forceRefresh = true) }.getOrNull()
                     if (refreshResult is app.backup.core.AuthSessionState.Valid) {
                         try {
                             withTimeout(batchTimeoutMs) {
+                                uploader.registerDevice(deviceId, deviceName, deviceModel, enabledTypes)
                                 uploader.upload(deviceId, validPairs.map { it.second })
                             }
                             dao.markSynced(validPairs.map { it.first.id })
@@ -666,20 +685,72 @@ object Engine {
                     }
 
                     if (!recovered) {
-                        val (summary, fix) = SyncErrorClassifier.classify(batchErr)
-                        lastFailure = summary to fix
-                        val batchIds = validPairs.map { it.first.id }
-                        dao.markFailed(batchIds, summary)
-                        seenFailedIds.addAll(batchIds)
-                        failedCount += batchIds.size
-                        onErrorRecorded(summary, fix)
-                        break
+                        if (validPairs.size == 1) {
+                            val (summary, fix) = SyncErrorClassifier.classify(batchErr)
+                            lastFailure = summary to fix
+                            val id = validPairs[0].first.id
+                            dao.markFailed(listOf(id), SyncErrorClassifier.recordReason(batchErr, summary))
+                            seenFailedIds += id
+                            failedCount++
+                            stopGlobalRulesLoop = true
+                        } else {
+                            // عزل السجل المتعارض فقط إذا نجحت بقية السجلات، مع قاطع مبكر بعد 3 إخفاقات قواعد متتالية دون أي نجاح
+                            var batchSingleUploaded = 0
+                            var consecutiveRulesDenials = 0
+                            for (idx in validPairs.indices) {
+                                if (!isOnline()) break
+                                val (row, enc) = validPairs[idx]
+                                try {
+                                    runWithTransientRetry {
+                                        uploader.upload(deviceId, listOf(enc))
+                                    }
+                                    dao.markSynced(listOf(row.id))
+                                    uploadedCount++
+                                    batchSingleUploaded++
+                                    consecutiveRulesDenials = 0
+                                } catch (e: TimeoutCancellationException) {
+                                    val (summary, fix) = SyncErrorClassifier.classify(e)
+                                    lastFailure = summary to fix
+                                    dao.markFailed(listOf(row.id), summary)
+                                    seenFailedIds += row.id
+                                    failedCount++
+                                    consecutiveRulesDenials = 0
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (itemErr: Exception) {
+                                    if (!isOnline()) break
+                                    val (summary, fix) = SyncErrorClassifier.classify(itemErr)
+                                    lastFailure = summary to fix
+                                    dao.markFailed(listOf(row.id), SyncErrorClassifier.recordReason(itemErr, summary))
+                                    seenFailedIds += row.id
+                                    failedCount++
+                                    consecutiveRulesDenials = if (SyncErrorClassifier.isRulesDeniedError(itemErr)) {
+                                        consecutiveRulesDenials + 1
+                                    } else {
+                                        0
+                                    }
+                                    if (batchSingleUploaded == 0 && consecutiveRulesDenials >= 3) {
+                                        val remainingIds = validPairs.subList(idx + 1, validPairs.size).map { it.first.id }
+                                        if (remainingIds.isNotEmpty()) {
+                                            dao.markFailed(remainingIds, SyncErrorClassifier.recordReason(itemErr, summary))
+                                            seenFailedIds.addAll(remainingIds)
+                                            failedCount += remainingIds.size
+                                        }
+                                        onErrorRecorded(summary, fix)
+                                        stopGlobalRulesLoop = true
+                                        break
+                                    }
+                                }
+                            }
+                            if (batchSingleUploaded > 0) batchesSinceCheckpoint++
+                        }
                     }
+                    if (stopGlobalRulesLoop) break
                 } else if (validPairs.size == 1) {
                     val (summary, fix) = SyncErrorClassifier.classify(batchErr)
                     lastFailure = summary to fix
                     val id = validPairs[0].first.id
-                    dao.markFailed(listOf(id), summary)
+                    dao.markFailed(listOf(id), SyncErrorClassifier.recordReason(batchErr, summary))
                     seenFailedIds += id
                     failedCount++
                 } else {
@@ -706,7 +777,7 @@ object Engine {
                             if (!isOnline()) break
                             val (summary, fix) = SyncErrorClassifier.classify(itemErr)
                             lastFailure = summary to fix
-                            dao.markFailed(listOf(row.id), summary)
+                            dao.markFailed(listOf(row.id), SyncErrorClassifier.recordReason(itemErr, summary))
                             seenFailedIds += row.id
                             failedCount++
                         }

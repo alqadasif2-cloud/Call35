@@ -67,10 +67,85 @@ async function ensureCapabilityAuthClean(uid: string): Promise<void> {
   if (isVaultCapabilityId(uid) && auth.currentUser) {
     try {
       await firebaseSignOut(auth);
+      await new Promise((resolve) => setTimeout(resolve, 60));
     } catch {
       // Best-effort signOut
     }
   }
+}
+
+function isFirestorePermissionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code).toLowerCase()
+      : '';
+  return (
+    code.includes('permission-denied') ||
+    msg.includes('permission-denied') ||
+    msg.includes('permission_denied') ||
+    msg.includes('missing or insufficient permissions')
+  );
+}
+
+function isTimestampLike(v: unknown): boolean {
+  if (!v || typeof v !== 'object') return false;
+  const obj = v as { toMillis?: unknown; seconds?: unknown };
+  return typeof obj.toMillis === 'function' || typeof obj.seconds === 'number';
+}
+
+function isValidDeviceDocData(data: Record<string, unknown> | undefined, uid: string): boolean {
+  if (!data) return false;
+  const required = ['ownerId', 'name', 'model', 'enabled', 'lastSyncAt', 'createdAt', 'updatedAt'];
+  const keys = Object.keys(data);
+  if (keys.length !== required.length || !required.every((k) => k in data)) return false;
+  if (data.ownerId !== uid) return false;
+  if (typeof data.name !== 'string' || data.name.length < 1 || data.name.length > BLUEPRINT_LIMITS.DEVICE_NAME_MAX_LEN) {
+    return false;
+  }
+  if (
+    typeof data.model !== 'string' ||
+    data.model.length < 1 ||
+    data.model.length > BLUEPRINT_LIMITS.DEVICE_MODEL_MAX_LEN
+  ) {
+    return false;
+  }
+  if (
+    !Array.isArray(data.enabled) ||
+    data.enabled.length > 3 ||
+    data.enabled.some((t) => !BLUEPRINT_LIMITS.ALLOWED_TYPES.includes(t as RecordType))
+  ) {
+    return false;
+  }
+  if (typeof data.lastSyncAt !== 'number' || !Number.isInteger(data.lastSyncAt) || data.lastSyncAt < 0) {
+    return false;
+  }
+  if (!isTimestampLike(data.createdAt) || !isTimestampLike(data.updatedAt)) return false;
+  return true;
+}
+
+function isValidRecordDocData(
+  data: Record<string, unknown> | undefined,
+  uid: string,
+  deviceId: string,
+  rec: EncRecord
+): boolean {
+  if (!data) return false;
+  const required = ['ownerId', 'deviceId', 'type', 'ts', 'iv', 'data', 'v', 'createdAt', 'updatedAt'];
+  const keys = Object.keys(data);
+  if (keys.length !== required.length || !required.every((k) => k in data)) return false;
+  if (data.ownerId !== uid || data.deviceId !== deviceId) return false;
+  if (data.type !== rec.type || Number(data.ts) !== Math.trunc(rec.ts) || Number(data.v) !== 1) return false;
+  if (typeof data.iv !== 'string' || data.iv.length < 12 || data.iv.length > BLUEPRINT_LIMITS.IV_MAX_LEN) return false;
+  if (
+    typeof data.data !== 'string' ||
+    data.data.length < 16 ||
+    data.data.length > BLUEPRINT_LIMITS.CIPHERTEXT_MAX_LEN
+  ) {
+    return false;
+  }
+  if (!isTimestampLike(data.createdAt) || !isTimestampLike(data.updatedAt)) return false;
+  return true;
 }
 
 function validateRecordForUpload(rec: EncRecord): void {
@@ -110,6 +185,7 @@ export const CloudRepo = {
     passphrase: string
   ): Promise<CryptoKey> {
     assertValidId(uid, 'uid');
+    await ensureCapabilityAuthClean(uid);
     const salt = randomBytes(16);
     const key = await deriveVaultKey(passphrase, salt, PBKDF2_ITERATIONS);
     const box = await encryptBox(key, CHECK_PLAIN, CHECK_AAD);
@@ -159,6 +235,7 @@ export const CloudRepo = {
    */
   async lookupCapabilityAccountUsername(uid: string): Promise<string | null> {
     assertValidId(uid, 'uid');
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}`;
     try {
       let snap;
@@ -185,17 +262,21 @@ export const CloudRepo = {
   /**
    * يتحقق مسبقًا من صلاحية جلسة الحساب وحالة رمز المصادقة (Auth Token) قبل محاولة الرفع.
    */
-  async validateSession(forceRefresh = false): Promise<{ valid: boolean; reason?: string; requiresRelogin?: boolean }> {
-    const session = ActiveSessionStore.load();
-    if (!session) return { valid: false, reason: 'لا توجد جلسة نشطة.', requiresRelogin: true };
-    if (session.uid.length === 50 && session.uid.startsWith('v_')) {
+  async validateSession(
+    forceRefresh = false,
+    explicitUid?: string
+  ): Promise<{ valid: boolean; reason?: string; requiresRelogin?: boolean }> {
+    const activeUid = explicitUid || ActiveSessionStore.getActiveUid();
+    if (!activeUid) return { valid: false, reason: 'لا توجد جلسة نشطة.', requiresRelogin: true };
+    if (isVaultCapabilityId(activeUid)) {
+      await ensureCapabilityAuthClean(activeUid);
       return { valid: true };
     }
     const currentFbUser = auth.currentUser;
     if (!currentFbUser) {
       return { valid: false, reason: 'لم يتم العثور على جلسة مصادقة نشطة في Firebase.', requiresRelogin: true };
     }
-    if (currentFbUser.uid !== session.uid) {
+    if (currentFbUser.uid !== activeUid) {
       return { valid: false, reason: 'معرّف Firebase لا يطابق الحساب النشط.', requiresRelogin: true };
     }
     try {
@@ -208,6 +289,7 @@ export const CloudRepo = {
 
   async getCurrentUsername(explicitUid?: string): Promise<string | null> {
     const uid = requireUid(explicitUid);
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}`;
     try {
       const snap = await getDoc(doc(db, 'users', uid));
@@ -282,6 +364,7 @@ export const CloudRepo = {
 
   async hasCrypto(explicitUid?: string): Promise<boolean> {
     const uid = requireUid(explicitUid);
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/meta/crypto`;
     try {
       const snap = await getDoc(doc(db, 'users', uid, 'meta', 'crypto'));
@@ -296,6 +379,7 @@ export const CloudRepo = {
    */
   async verifyLiveCloudRoundtrip(): Promise<LiveCloudCheckResult> {
     const uid = requireUid();
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/meta/crypto`;
     const start = performance.now();
     try {
@@ -313,6 +397,7 @@ export const CloudRepo = {
 
   async createCrypto(passphrase: string, explicitUid?: string): Promise<CryptoKey> {
     const uid = requireUid(explicitUid);
+    await ensureCapabilityAuthClean(uid);
     const salt = randomBytes(16);
     const key = await deriveVaultKey(passphrase, salt, PBKDF2_ITERATIONS);
     const box = await encryptBox(key, CHECK_PLAIN, CHECK_AAD);
@@ -338,6 +423,7 @@ export const CloudRepo = {
 
   async unlock(passphrase: string, explicitUid?: string): Promise<CryptoKey | null> {
     const uid = requireUid(explicitUid);
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/meta/crypto`;
     let snap;
     try {
@@ -376,6 +462,7 @@ export const CloudRepo = {
   ): Promise<void> {
     const uid = requireUid(explicitUid);
     assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
 
     const safeName = (name.trim() || 'جهاز بدون اسم').slice(0, BLUEPRINT_LIMITS.DEVICE_NAME_MAX_LEN);
     const safeModel = (model.trim() || 'Web Vault').slice(0, BLUEPRINT_LIMITS.DEVICE_MODEL_MAX_LEN);
@@ -386,6 +473,18 @@ export const CloudRepo = {
     const path = `users/${uid}/devices/${deviceId}`;
     const ref = doc(db, 'users', uid, 'devices', deviceId);
 
+    const recreateDeviceDoc = async (preservedLastSyncAt: number) => {
+      await setDoc(ref, {
+        ownerId: uid,
+        name: safeName,
+        model: safeModel,
+        enabled: safeEnabled,
+        lastSyncAt: Math.max(0, Math.trunc(preservedLastSyncAt)),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    };
+
     let existingSnap;
     try {
       existingSnap = await getDoc(ref);
@@ -395,48 +494,108 @@ export const CloudRepo = {
 
     if (!existingSnap.exists()) {
       try {
-        await setDoc(ref, {
-          ownerId: uid,
-          name: safeName,
-          model: safeModel,
-          enabled: safeEnabled,
-          lastSyncAt: 0,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await recreateDeviceDoc(0);
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, path);
       }
-    } else {
-      try {
-        await updateDoc(ref, {
-          name: safeName,
-          model: safeModel,
-          enabled: safeEnabled,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, path);
-      }
+      return;
     }
-  },
 
-  async markDeviceSynced(deviceId: string, syncedAtMs: number): Promise<void> {
-    const uid = requireUid();
-    assertValidId(deviceId, 'deviceId');
-    const path = `users/${uid}/devices/${deviceId}`;
+    const rawData = existingSnap.data();
+    if (!isValidDeviceDocData(rawData, uid)) {
+      if (rawData?.ownerId !== uid) {
+        handleFirestoreError(new Error('PERMISSION_DENIED: Device ownerId mismatch'), OperationType.UPDATE, path);
+      }
+      const preservedSync =
+        typeof rawData.lastSyncAt === 'number' && Number.isFinite(rawData.lastSyncAt) && rawData.lastSyncAt >= 0
+          ? Math.trunc(rawData.lastSyncAt)
+          : 0;
+      try {
+        await deleteDoc(ref);
+        await recreateDeviceDoc(preservedSync);
+      } catch (healErr) {
+        handleFirestoreError(healErr, OperationType.WRITE, path);
+      }
+      return;
+    }
+
+    const curEnabled = Array.isArray(rawData.enabled) ? rawData.enabled.map(String) : [];
+    const needsUpdate =
+      rawData.name !== safeName ||
+      rawData.model !== safeModel ||
+      curEnabled.length !== safeEnabled.length ||
+      curEnabled.some((v, idx) => v !== safeEnabled[idx]);
+
+    if (!needsUpdate) return;
+
     try {
-      await updateDoc(doc(db, 'users', uid, 'devices', deviceId), {
-        lastSyncAt: Math.max(0, Math.trunc(syncedAtMs)),
+      await updateDoc(ref, {
+        name: safeName,
+        model: safeModel,
+        enabled: safeEnabled,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
+      if (isFirestorePermissionError(error) && rawData?.ownerId === uid) {
+        const preservedSync =
+          typeof rawData.lastSyncAt === 'number' && Number.isFinite(rawData.lastSyncAt) && rawData.lastSyncAt >= 0
+            ? Math.trunc(rawData.lastSyncAt)
+            : 0;
+        try {
+          await deleteDoc(ref);
+          await recreateDeviceDoc(preservedSync);
+          return;
+        } catch (healErr) {
+          handleFirestoreError(healErr, OperationType.WRITE, path);
+        }
+      }
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  },
+
+  async markDeviceSynced(deviceId: string, syncedAtMs: number, explicitUid?: string): Promise<void> {
+    const uid = requireUid(explicitUid);
+    assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
+    const path = `users/${uid}/devices/${deviceId}`;
+    const ref = doc(db, 'users', uid, 'devices', deviceId);
+    const safeTs = Math.max(0, Math.trunc(syncedAtMs));
+    try {
+      await updateDoc(ref, {
+        lastSyncAt: safeTs,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      if (isFirestorePermissionError(error)) {
+        try {
+          const snap = await getDoc(ref);
+          const raw = snap.data();
+          if (snap.exists() && raw?.ownerId === uid && !isValidDeviceDocData(raw, uid)) {
+            await deleteDoc(ref);
+            await setDoc(ref, {
+              ownerId: uid,
+              name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 100) : 'جهاز نسخ احتياطي',
+              model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim().slice(0, 100) : 'Web Vault',
+              enabled: Array.isArray(raw.enabled)
+                ? raw.enabled.filter((t) => BLUEPRINT_LIMITS.ALLOWED_TYPES.includes(t as RecordType)).slice(0, 3)
+                : [RecordType.CALL, RecordType.SMS, RecordType.CLIP],
+              lastSyncAt: safeTs,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            return;
+          }
+        } catch {
+          // Fall through to report original error
+        }
+      }
       handleFirestoreError(error, OperationType.UPDATE, path);
     }
   },
 
   async listDevices(): Promise<DeviceInfo[]> {
     const uid = requireUid();
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices`;
     try {
       const q = query(collection(db, 'users', uid, 'devices'), where('ownerId', '==', uid));
@@ -469,6 +628,7 @@ export const CloudRepo = {
     onError: (err: Error) => void
   ): Unsubscribe {
     const uid = requireUid();
+    void ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices`;
     const q = query(collection(db, 'users', uid, 'devices'), where('ownerId', '==', uid));
     return onSnapshot(
@@ -509,6 +669,7 @@ export const CloudRepo = {
   async listDeviceRecords(deviceId: string): Promise<EncRecord[]> {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices/${deviceId}/records`;
     try {
       const q = query(
@@ -541,6 +702,7 @@ export const CloudRepo = {
   ): Unsubscribe {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
+    void ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices/${deviceId}/records`;
     const q = query(
       collection(db, 'users', uid, 'devices', deviceId, 'records'),
@@ -577,15 +739,16 @@ export const CloudRepo = {
   /**
    * Uploads encrypted records in atomic batches (<= 400).
    * Optimistically writes new records without pre-reads (avoiding forbidden whereIn(documentId) queries),
-   * and falls back to per-document `getDoc` (`allow get`) only when updating pre-existing IDs.
+   * and falls back to per-document `getDoc` (`allow get`) only when updating pre-existing IDs or healing
+   * malformed owner-owned legacy records.
    */
-  async uploadBatch(deviceId: string, records: EncRecord[]): Promise<void> {
+  async uploadBatch(deviceId: string, records: EncRecord[], explicitUid?: string): Promise<void> {
     if (records.length === 0) return;
     if (records.length > 400) {
       throw new Error('حجم الدفعة يتجاوز الحد الأقصى المسموح به (400 سجل).');
     }
 
-    const uid = requireUid();
+    const uid = requireUid(explicitUid);
     assertValidId(deviceId, 'deviceId');
     await ensureCapabilityAuthClean(uid);
     const basePath = `users/${uid}/devices/${deviceId}/records`;
@@ -627,10 +790,7 @@ export const CloudRepo = {
       return;
     } catch (error) {
       const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-      const isConflictOrRules =
-        msg.includes('permission-denied') ||
-        msg.includes('missing or insufficient permissions') ||
-        msg.includes('already-exists');
+      const isConflictOrRules = isFirestorePermissionError(error) || msg.includes('already-exists');
       if (!isConflictOrRules) {
         handleFirestoreError(error, OperationType.WRITE, basePath);
       }
@@ -640,31 +800,66 @@ export const CloudRepo = {
       }
 
       const existingIds = new Set<string>();
-      try {
-        for (let i = 0; i < uniqueRecords.length; i += 25) {
-          const slice = uniqueRecords.slice(i, i + 25);
-          const snaps = await Promise.all(
-            slice.map(async (rec) => ({
-              id: rec.id,
-              snap: await getDoc(doc(db, 'users', uid, 'devices', deviceId, 'records', rec.id)),
-            }))
-          );
-          for (const item of snaps) {
-            if (item.snap.exists()) existingIds.add(item.id);
+      const malformedOwnedIds = new Set<string>();
+      let firstReadError: unknown = null;
+      let firstReadErrorPath = basePath;
+
+      for (let i = 0; i < uniqueRecords.length; i += 25) {
+        const slice = uniqueRecords.slice(i, i + 25);
+        const results = await Promise.all(
+          slice.map(async (rec) => {
+            const recPath = `${basePath}/${rec.id}`;
+            try {
+              const snap = await getDoc(doc(db, 'users', uid, 'devices', deviceId, 'records', rec.id));
+              return { rec, recPath, snap, err: null as unknown };
+            } catch (readErr) {
+              return { rec, recPath, snap: null, err: readErr };
+            }
+          })
+        );
+        for (const item of results) {
+          if (item.err) {
+            if (!firstReadError) {
+              firstReadError = item.err;
+              firstReadErrorPath = item.recPath;
+            }
+            continue;
+          }
+          if (item.snap?.exists()) {
+            const d = item.snap.data();
+            if (isValidRecordDocData(d, uid, deviceId, item.rec)) {
+              existingIds.add(item.rec.id);
+            } else if (d?.ownerId === uid) {
+              malformedOwnedIds.add(item.rec.id);
+            }
           }
         }
-      } catch (readErr) {
-        handleFirestoreError(readErr, OperationType.GET, basePath);
       }
 
-      if (existingIds.size === 0) {
-        handleFirestoreError(error, OperationType.WRITE, basePath);
+      if (firstReadError && uniqueRecords.length === 1) {
+        handleFirestoreError(firstReadError, OperationType.GET, firstReadErrorPath);
+      }
+
+      if (malformedOwnedIds.size > 0 && !firstReadError) {
+        for (const badId of malformedOwnedIds) {
+          try {
+            await deleteDoc(doc(db, 'users', uid, 'devices', deviceId, 'records', badId));
+          } catch (delErr) {
+            handleFirestoreError(delErr, OperationType.DELETE, `${basePath}/${badId}`);
+          }
+        }
+      }
+
+      if (firstReadError || (existingIds.size === 0 && malformedOwnedIds.size === 0)) {
+        const targetPath = uniqueRecords.length === 1 ? `${basePath}/${uniqueRecords[0].id}` : basePath;
+        handleFirestoreError(firstReadError ?? error, OperationType.WRITE, targetPath);
       }
 
       try {
         await commitWithExisting(existingIds);
       } catch (retryErr) {
-        handleFirestoreError(retryErr, OperationType.WRITE, basePath);
+        const targetPath = uniqueRecords.length === 1 ? `${basePath}/${uniqueRecords[0].id}` : basePath;
+        handleFirestoreError(retryErr, OperationType.WRITE, targetPath);
       }
     }
   },
@@ -673,6 +868,7 @@ export const CloudRepo = {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
     assertValidId(recId, 'recId');
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices/${deviceId}/records/${recId}`;
     try {
       await deleteDoc(doc(db, 'users', uid, 'devices', deviceId, 'records', recId));
@@ -684,6 +880,7 @@ export const CloudRepo = {
   async deleteDeviceRecords(deviceId: string): Promise<number> {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
     const path = `users/${uid}/devices/${deviceId}/records`;
 
     let allDocs;
@@ -713,6 +910,7 @@ export const CloudRepo = {
   async deleteDevice(deviceId: string): Promise<void> {
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
     await CloudRepo.deleteDeviceRecords(deviceId);
     const path = `users/${uid}/devices/${deviceId}`;
     try {
@@ -727,6 +925,7 @@ export const CloudRepo = {
     customDeleteFn?: (pw: string) => Promise<boolean>
   ): Promise<void> {
     const uid = requireUid();
+    await ensureCapabilityAuthClean(uid);
     const fbUser = auth.currentUser;
     const trimmed = password.trim();
     if (!trimmed) throw new Error('يرجى إدخال كلمة المرور لتأكيد حذف الحساب.');
