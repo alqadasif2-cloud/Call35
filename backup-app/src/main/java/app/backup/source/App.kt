@@ -30,15 +30,30 @@ class App : Application() {
         NetworkRestoreMonitor.register(this)
         Scheduler.ensureBackgroundSchedule(this)
 
+        // استعادة السجلات الفاشلة سابقًا تلقائيًا بعد التحديث حتى بدون فتح الواجهة إذا كانت الجلسة محفوظة مسبقًا
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching {
+                val uid = Engine.activeUidOrEmpty(this@App)
+                if (uid.isNotBlank()) {
+                    val dao = AppDb.get(this@App).dao()
+                    val recovered = Engine.applyOneTimeUploadFixRecoveryIfNeeded(this@App, dao, uid)
+                    if (!Prefs.paused.value && (recovered > 0 || dao.pendingOrRetryableNowForUser(uid) > 0)) {
+                        Scheduler.enqueueImmediateUpload(this@App, expedited = true)
+                    }
+                }
+            }
+        }
+
         // إعادة محاولة السجلات الفاشلة وتشغيل الجدولة تلقائيًا عند تسجيل دخول جديد
         app.backup.core.Session.onSessionActivated = { uid ->
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                 runCatching {
                     val dao = AppDb.get(this@App).dao()
                     val retried = dao.retryFailedNow(uid)
+                    Engine.applyOneTimeUploadFixRecoveryIfNeeded(this@App, dao, uid)
                     Prefs.clearSyncError()
                     Scheduler.ensureBackgroundSchedule(this@App)
-                    if (retried > 0 || dao.pendingOrFailedNowForUser(uid) > 0) {
+                    if (retried > 0 || dao.pendingOrRetryableNowForUser(uid) > 0) {
                         Scheduler.enqueueImmediateUpload(this@App, expedited = true)
                     }
                 }
@@ -96,7 +111,7 @@ object LiveContentObservers {
                 val dao = AppDb.get(appCtx).dao()
                 Engine.scan(appCtx, dao)
                 val uid = Engine.activeUidOrEmpty(appCtx)
-                if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrFailedNowForUser(uid) > 0) {
+                if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrRetryableNowForUser(uid) > 0) {
                     Scheduler.enqueueImmediateUpload(appCtx)
                 }
             }
@@ -157,8 +172,9 @@ object NetworkRestoreMonitor {
                         val uid = Engine.activeUidOrEmpty(appCtx)
                         if (uid.isBlank()) return@launch
                         val dao = AppDb.get(appCtx).dao()
+                        Engine.applyOneTimeUploadFixRecoveryIfNeeded(appCtx, dao, uid)
                         dao.promoteLocalToPending(uid)
-                        if (dao.pendingOrFailedNowForUser(uid) > 0) {
+                        if (dao.pendingOrRetryableNowForUser(uid) > 0) {
                             Scheduler.enqueueImmediateUpload(appCtx, expedited = true)
                         }
                     }

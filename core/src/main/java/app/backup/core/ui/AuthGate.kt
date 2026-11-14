@@ -50,7 +50,7 @@ fun AuthGate(content: @Composable () -> Unit) {
     DisposableEffect(Unit) {
         val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
             val current = firebaseAuth.currentUser
-            if (current != null && Session.key != null && Session.uid.isNullOrBlank()) {
+            if (!UsernameAuth.inProgress && current != null && Session.key != null && Session.uid.isNullOrBlank()) {
                 Session.uid = current.uid
             }
         }

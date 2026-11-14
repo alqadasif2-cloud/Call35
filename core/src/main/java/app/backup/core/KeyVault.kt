@@ -44,21 +44,31 @@ object Session {
         uid = null
     }
 
+    private fun clearConflictingFirebaseAuth(resolvedUid: String) {
+        if (CloudRepo.isVaultCapabilityId(resolvedUid)) {
+            val fbAuth = runCatching { FirebaseAuth.getInstance() }.getOrNull()
+            if (fbAuth?.currentUser != null) {
+                runCatching { fbAuth.signOut() }
+            }
+        }
+    }
+
     /**
      * يستعيد الجلسة المحفوظة بأمان عبر Android Keystore عند فتح التطبيق أو عمل المزامنة الخلفية،
      * فلا يُطلب من المستخدم تسجيل الدخول مجددًا ما لم يسجّل الخروج صراحةً.
      */
     fun ensureLoaded(context: Context): Pair<String, ByteArray>? {
-        val memUid = uid ?: runCatching { FirebaseAuth.getInstance().currentUser?.uid }.getOrNull()
+        val memUid = uid
         val memKey = key
         if (!memUid.isNullOrBlank() && memKey != null) {
-            if (uid != memUid) uid = memUid
+            clearConflictingFirebaseAuth(memUid)
             return memUid to memKey
         }
 
         val vault = KeyVault(context.applicationContext)
         val stored = vault.loadSession()
         if (stored != null) {
+            clearConflictingFirebaseAuth(stored.first)
             activate(stored.first, stored.second, isFreshAuth = false)
             return stored
         }
@@ -66,6 +76,7 @@ object Session {
         val fbUid = runCatching { FirebaseAuth.getInstance().currentUser?.uid }.getOrNull()
         val legacyKey = vault.load()
         if (!fbUid.isNullOrBlank() && legacyKey != null) {
+            clearConflictingFirebaseAuth(fbUid)
             activate(fbUid, legacyKey, isFreshAuth = false)
             return fbUid to legacyKey
         }

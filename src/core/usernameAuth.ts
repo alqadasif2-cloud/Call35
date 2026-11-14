@@ -242,6 +242,9 @@ export const UsernameAuth = {
           ? await CloudRepo.unlock(validPw, uid)
           : await CloudRepo.createCrypto(validPw, uid);
       } else {
+        if (auth.currentUser) {
+          await firebaseSignOut(auth).catch(() => {});
+        }
         uid = await deriveCapabilityUid(norm.usernameId, validPw);
         key = await CloudRepo.registerCapabilityAccount(uid, norm, validPw);
       }
@@ -311,6 +314,9 @@ export const UsernameAuth = {
           : await CloudRepo.createCrypto(validPw, uid);
         resolvedUsername = (await CloudRepo.getCurrentUsername(uid)) || norm.username;
       } else {
+        if (auth.currentUser) {
+          await firebaseSignOut(auth).catch(() => {});
+        }
         uid = await deriveCapabilityUid(norm.usernameId, validPw);
         const storedUsername = await CloudRepo.lookupCapabilityAccountUsername(uid);
         if (!storedUsername) {

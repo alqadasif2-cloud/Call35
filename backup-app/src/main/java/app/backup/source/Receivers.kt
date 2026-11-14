@@ -120,7 +120,7 @@ class PhoneStateReceiver : BroadcastReceiver() {
                     val dao = AppDb.get(appCtx).dao()
                     Engine.scan(appCtx, dao)
                     val uid = Engine.activeUidOrEmpty(appCtx)
-                    if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrFailedNowForUser(uid) > 0) {
+                    if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrRetryableNowForUser(uid) > 0) {
                         Scheduler.enqueueImmediateUpload(appCtx)
                     }
                     // فحص تأكيدي إضافي بعد 8 ثوانٍ تحسبًا للأجهزة التي تتأخر في تحديث سجل المكالمات
@@ -159,9 +159,12 @@ class BootReceiver : BroadcastReceiver() {
                     Scheduler.ensureBackgroundSchedule(appCtx)
                     if (Prefs.onboardingDone.value && !Prefs.paused.value) {
                         val dao = AppDb.get(appCtx).dao()
-                        Engine.scan(appCtx, dao)
                         val uid = Engine.activeUidOrEmpty(appCtx)
-                        if (uid.isNotBlank() && dao.pendingOrFailedNowForUser(uid) > 0) {
+                        if (uid.isNotBlank()) {
+                            Engine.applyOneTimeUploadFixRecoveryIfNeeded(appCtx, dao, uid)
+                        }
+                        Engine.scan(appCtx, dao)
+                        if (uid.isNotBlank() && dao.pendingOrRetryableNowForUser(uid) > 0) {
                             Scheduler.enqueueImmediateUpload(appCtx, expedited = false)
                         }
                     }

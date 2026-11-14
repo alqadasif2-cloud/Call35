@@ -121,7 +121,8 @@ object Rec {
 /** التحقق من صحة البيانات قبل الحفظ المحلي. */
 object Validator {
     fun ok(r: PlainRecord): Boolean {
-        if (r.ts <= 0L) return false
+        if (r.ts !in 1L..9_999_999_999_999L) return false
+        if (r.id.length !in 1..128) return false
         return when (r.type) {
             RecordType.CALL -> true // الرقم قد يكون فارغًا للمتصل المخفي
             RecordType.SMS -> r.fields.optString("address").isNotBlank()

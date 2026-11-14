@@ -41,6 +41,7 @@ import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -173,33 +174,39 @@ class FirestoreCloudUploader(private val repo: CloudRepo) : CloudUploader {
 }
 
 object SyncErrorClassifier {
-    fun classify(e: Throwable): Pair<String, String> = when {
-        e is TimeoutCancellationException ->
-            "انتهت مهلة الاتصال بالخادم أثناء الرفع" to
-                "تأكد من استقرار شبكة الإنترنت؛ سيعيد WorkManager محاولة رفع السجلات المتبقية تلقائيًا."
-        e is FirebaseNetworkException || e is IOException ->
-            "تعذّر الوصول إلى السحابة بسبب انقطاع الإنترنت" to
-                "جميع السجلات محفوظة محليًا في Room وستُرفع تلقائيًا فور عودة الاتصال."
-        e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAVAILABLE ->
-            "الخدمة السحابية غير متاحة مؤقتًا أو الشبكة ضعيفة" to
-                "تبقى السجلات في قائمة الانتظار المحلية وسيُعاد رفعها تلقائيًا بتأخير متزايد."
-        (e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) ||
-            e.message?.contains("رفضت قواعد أمان Firebase") == true ->
-            "رفضت قواعد أمان Firebase حفظ الدفعة" to
-                "افتح التطبيق وسجّل الخروج ثم أعد تسجيل الدخول لتحديث جلسة المصادقة، ثم اضغط «إعادة محاولة الفاشل»."
-        e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAUTHENTICATED ->
-            "انتهت صلاحية جلسة المصادقة السحابية" to
-                "افتح التطبيق وأعد تسجيل الدخول بحسابك لاستئناف المزامنة."
-        e is FirebaseAuthRecentLoginRequiredException ->
-            "يلزم تحديث تسجيل الدخول للحساب" to
-                "سجّل الخروج ثم الدخول مجددًا داخل التطبيق."
-        e is FirebaseTooManyRequestsException ||
-            (e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED) ->
-            "تم تجاوز حد الطلبات المؤقت في السحابة" to
-                "انتظر قليلًا؛ سيعيد التطبيق المحاولة تلقائيًا دون ضياع أي سجل."
-        else ->
-            "تعذّر رفع بعض السجلات (${e.javaClass.simpleName})" to
-                "تحقق من اتصال الإنترنت، أو اضغط «إعادة محاولة السجلات الفاشلة» لإعادة إرسالها فقط."
+    fun classify(e: Throwable): Pair<String, String> {
+        val fsCode = (e as? FirebaseFirestoreException)?.code?.name
+        val detail = e.message?.trim()?.replace(Regex("\\s+"), " ")?.take(120)
+        return when {
+            e is TimeoutCancellationException ->
+                "انتهت مهلة الاتصال بالخادم أثناء الرفع" to
+                    "تأكد من استقرار شبكة الإنترنت؛ سيعيد WorkManager محاولة رفع السجلات المتبقية تلقائيًا."
+            e is FirebaseNetworkException || e is IOException ->
+                "تعذّر الوصول إلى السحابة بسبب انقطاع الإنترنت" to
+                    "جميع السجلات محفوظة محليًا في Room وستُرفع تلقائيًا فور عودة الاتصال."
+            e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAVAILABLE ->
+                "الخدمة السحابية غير متاحة مؤقتًا أو الشبكة ضعيفة" to
+                    "تبقى السجلات في قائمة الانتظار المحلية وسيُعاد رفعها تلقائيًا بتأخير متزايد."
+            (e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) ||
+                e.message?.contains("رفضت قواعد أمان Firebase") == true ->
+                "رفضت قواعد أمان Firebase حفظ الدفعة" to
+                    "تحقق من جلسة المصادقة وصلاحية الحساب ثم اضغط «إعادة محاولة الفاشل»." +
+                        if (!detail.isNullOrBlank()) " ($detail)" else ""
+            e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.UNAUTHENTICATED ->
+                "انتهت صلاحية جلسة المصادقة السحابية" to
+                    "افتح التطبيق وأعد تسجيل الدخول بحسابك لاستئناف المزامنة."
+            e is FirebaseAuthRecentLoginRequiredException ->
+                "يلزم تحديث تسجيل الدخول للحساب" to
+                    "سجّل الخروج ثم الدخول مجددًا داخل التطبيق."
+            e is FirebaseTooManyRequestsException ||
+                (e is FirebaseFirestoreException && e.code == FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED) ->
+                "تم تجاوز حد الطلبات المؤقت في السحابة" to
+                    "انتظر قليلًا؛ سيعيد التطبيق المحاولة تلقائيًا دون ضياع أي سجل."
+            else ->
+                "تعذّر رفع بعض السجلات (${fsCode ?: e.javaClass.simpleName})" to
+                    (if (!detail.isNullOrBlank()) "التفاصيل: $detail — " else "") +
+                    "تحقق من اتصال الإنترنت، أو اضغط «إعادة محاولة السجلات الفاشلة» لإعادة إرسالها فقط."
+        }
     }
 }
 
@@ -291,11 +298,34 @@ object Engine {
         )
         if (!holdLocally && scheduleUpload) {
             dao.promoteLocalToPending(uid)
-            if (inserted > 0 || dao.pendingOrFailedNowForUser(uid) > 0) {
+            if (inserted > 0 || dao.pendingOrRetryableNowForUser(uid) > 0) {
                 Scheduler.enqueueImmediateUpload(appCtx)
             }
         }
         return inserted
+    }
+
+    /**
+     * استعادة آمنة لمرة واحدة بعد إصلاح علة الرفع (استعلام whereIn المحظور + تعارض الجلسة):
+     * تعيد السجلات الفاشلة سابقًا إلى PENDING (مع تصفير العداد ومسح رسالة الخطأ القديمة) وترقّي LOCAL_ONLY إذا لم يكن الإيقاف المؤقت مفعّلًا،
+     * دون حذف أو تكرار أي سجل محلي أو سحابي.
+     */
+    suspend fun applyOneTimeUploadFixRecoveryIfNeeded(ctx: Context, dao: RecordDao, uid: String): Int {
+        if (uid.isBlank()) return 0
+        val appCtx = ctx.applicationContext
+        Prefs.ensureInit(appCtx)
+        if (Prefs.isUploadFixRecoveryApplied(uid)) return 0
+
+        if (Prefs.isPrimaryOwner(uid)) {
+            dao.claimLegacyUnownedRecords(uid)
+        }
+        val recoveredFailed = dao.recoverFailedForUpgrade(uid)
+        val promotedLocal = if (!Prefs.paused.value) dao.promoteLocalToPending(uid) else 0
+        if (recoveredFailed > 0 || promotedLocal > 0) {
+            Prefs.clearSyncError()
+        }
+        Prefs.markUploadFixRecoveryApplied(uid)
+        return recoveredFailed + promotedLocal
     }
 
     /** يُستدعى فور وصول بث SMS_RECEIVED لحفظ الرسالة بتوقيتها الأصلي وجدولة رفعها حتى والتطبيق مغلق. */
@@ -403,11 +433,47 @@ object Engine {
         return@withLock added
     }
 
+    private fun isTransientUploadError(e: Exception): Boolean = when (e) {
+        is TimeoutCancellationException,
+        is FirebaseNetworkException,
+        is IOException,
+        is FirebaseTooManyRequestsException -> true
+        is FirebaseFirestoreException -> e.code == FirebaseFirestoreException.Code.UNAVAILABLE ||
+            e.code == FirebaseFirestoreException.Code.DEADLINE_EXCEEDED ||
+            e.code == FirebaseFirestoreException.Code.ABORTED ||
+            e.code == FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED ||
+            e.code == FirebaseFirestoreException.Code.INTERNAL
+        else -> false
+    }
+
+    private fun validateLocalBeforeUpload(deviceId: String, row: RecordEntity, enc: EncRecord): String? {
+        if (!CloudRepo.VALID_ID_REGEX.matches(deviceId) || deviceId.length !in 1..128) {
+            return "معرّف الجهاز غير صالح للرفع"
+        }
+        if (!CloudRepo.VALID_ID_REGEX.matches(row.id) || row.id.length !in 1..128) {
+            return "معرّف السجل غير صالح (${row.id.take(24)})"
+        }
+        if (row.type !in CloudRepo.ALLOWED_TYPES) {
+            return "نوع السجل غير مدعوم (${row.type})"
+        }
+        if (row.ts !in 1L..9_999_999_999_999L) {
+            return "توقيت السجل خارج النطاق الصحيح (${row.ts})"
+        }
+        if (enc.iv.length !in 12..64) {
+            return "طول متجه التشفير (IV) غير صالح"
+        }
+        if (enc.data.length !in 16..CloudRepo.MAX_CIPHERTEXT_LEN) {
+            return "حجم السجل المشفّر يتجاوز الحد المسموح (${enc.data.length})"
+        }
+        return null
+    }
+
     /**
-     * تنفيذ الرفع المشفّر على دفعات مع عزل الأخطاء الجزئية:
+     * تنفيذ الرفع المشفّر على دفعات (50 سجلًا لكل دفعة) مع إعادة محاولة ذكية وعزل الأخطاء الفردية:
      * - لا يُعلَّم أي سجل كـ SYNCED إلا بعد تأكيد الخادم.
+     * - يتحقق من صلاحية كل سجل منفردًا قبل إرساله بحيث لا يُفشل سجل واحد تالف الدفعة بأكملها.
      * - عند فشل دفعة جزئيًا يُعاد رفع كل سجل منفردًا بحيث تُحفظ السجلات الناجحة وتُعلَّم الفاشلة فقط كـ FAILED.
-     * - لا يُحدَّث وقت «آخر مزامنة ناجحة» إذا لم يُرفع أي سجل فعليًا.
+     * - يحدّث «آخر مزامنة ناجحة» كل 10 دفعات (500 سجل) وعند الانتهاء إذا رُفع سجل واحد على الأقل.
      */
     suspend fun uploadRecords(
         dao: RecordDao,
@@ -423,20 +489,42 @@ object Engine {
         onErrorRecorded: (String, String) -> Unit = { _, _ -> },
         onErrorCleared: () -> Unit = {},
         onLastSyncUpdated: (Long) -> Unit = {},
+        transientRetryDelayMs: Long = 350L,
+        maxRunDurationMs: Long = Long.MAX_VALUE,
     ): SyncResult {
         if (!isOnline()) return SyncResult.Offline
         dao.promoteLocalToPending(uid)
 
-        val initialPending = dao.pendingForUser(uid, 100)
+        val initialPending = dao.pendingForUser(uid, 50)
         if (initialPending.isEmpty()) {
             onErrorCleared()
             return SyncResult.NothingToUpload
         }
 
+        suspend fun runWithTransientRetry(block: suspend () -> Unit) {
+            var attempt = 0
+            while (true) {
+                try {
+                    withTimeout(batchTimeoutMs) { block() }
+                    return
+                } catch (e: TimeoutCancellationException) {
+                    if (!isOnline() || attempt >= 2) throw e
+                    attempt++
+                    if (transientRetryDelayMs > 0L) delay(transientRetryDelayMs * attempt)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (!isOnline() || !isTransientUploadError(e) || attempt >= 2) throw e
+                    attempt++
+                    if (transientRetryDelayMs > 0L) delay(transientRetryDelayMs * attempt)
+                }
+            }
+        }
+
         // 1) التحقق الاستباقي من صلاحية الجلسة وحالة رمز المصادقة قبل بدء محاولة الرفع
         val sessionCheck = try {
             uploader.validateSession(forceRefresh = false)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             if (!isOnline()) return SyncResult.Offline
             app.backup.core.AuthSessionState.ExpiredNeedsRefresh
         }
@@ -453,7 +541,7 @@ object Engine {
         }
 
         try {
-            withTimeout(batchTimeoutMs) {
+            runWithTransientRetry {
                 uploader.registerDevice(deviceId, deviceName, deviceModel, enabledTypes)
             }
         } catch (e: TimeoutCancellationException) {
@@ -496,20 +584,36 @@ object Engine {
 
         var uploadedCount = 0
         var failedCount = 0
+        var batchesSinceCheckpoint = 0
         var lastFailure: Pair<String, String>? = null
         val seenFailedIds = HashSet<String>()
+        val startedAtMs = System.currentTimeMillis()
+        var stoppedForTimeBudget = false
 
         while (true) {
             if (!isOnline()) break
-            val candidates = dao.pendingForUser(uid, 150)
+            if (uploadedCount > 0 && (System.currentTimeMillis() - startedAtMs) >= maxRunDurationMs) {
+                stoppedForTimeBudget = true
+                break
+            }
+            val candidates = dao.pendingForUser(uid, 100)
                 .filter { it.id !in seenFailedIds }
-                .take(100)
+                .take(50)
             if (candidates.isEmpty()) break
 
             val validPairs = ArrayList<Pair<RecordEntity, EncRecord>>(candidates.size)
             for (row in candidates) {
                 try {
-                    validPairs += row to RecordCodec.encrypt(key, row.toPlain(deviceId))
+                    val enc = RecordCodec.encrypt(key, row.toPlain(deviceId))
+                    val validationErr = validateLocalBeforeUpload(deviceId, row, enc)
+                    if (validationErr != null) {
+                        dao.markFailed(listOf(row.id), validationErr)
+                        seenFailedIds += row.id
+                        failedCount++
+                        lastFailure = validationErr to "سجل محلي غير مطابق لقواعد السحابة وعُزل دون إيقاف بقية السجلات."
+                        continue
+                    }
+                    validPairs += row to enc
                 } catch (e: Exception) {
                     val reason = "سجل محلي تالف تعذّر تشفيره (${e.javaClass.simpleName})"
                     dao.markFailed(listOf(row.id), reason)
@@ -521,11 +625,12 @@ object Engine {
             if (validPairs.isEmpty()) continue
 
             try {
-                withTimeout(batchTimeoutMs) {
+                runWithTransientRetry {
                     uploader.upload(deviceId, validPairs.map { it.second })
                 }
                 dao.markSynced(validPairs.map { it.first.id })
                 uploadedCount += validPairs.size
+                batchesSinceCheckpoint++
             } catch (e: TimeoutCancellationException) {
                 if (!isOnline()) break
                 val (summary, fix) = SyncErrorClassifier.classify(e)
@@ -544,7 +649,6 @@ object Engine {
                     batchErr.message.orEmpty().contains("رفضت قواعد أمان Firebase")
 
                 if (isRulesDenied) {
-                    // محاولة تجديد رمز المصادقة لمرة واحدة وإعادة إرسال الدفعة
                     var recovered = false
                     val refreshResult = runCatching { uploader.validateSession(forceRefresh = true) }.getOrNull()
                     if (refreshResult is app.backup.core.AuthSessionState.Valid) {
@@ -554,6 +658,7 @@ object Engine {
                             }
                             dao.markSynced(validPairs.map { it.first.id })
                             uploadedCount += validPairs.size
+                            batchesSinceCheckpoint++
                             recovered = true
                         } catch (_: Exception) {
                             recovered = false
@@ -561,8 +666,6 @@ object Engine {
                     }
 
                     if (!recovered) {
-                        // عند رفض القواعد بشكل قاطع:
-                        // 1) تحديث حالة السجلات في Room دفعةً واحدة إلى FAILED مع توضيح السبب بدقة
                         val (summary, fix) = SyncErrorClassifier.classify(batchErr)
                         lastFailure = summary to fix
                         val batchIds = validPairs.map { it.first.id }
@@ -570,7 +673,6 @@ object Engine {
                         seenFailedIds.addAll(batchIds)
                         failedCount += batchIds.size
                         onErrorRecorded(summary, fix)
-                        // 2) التوقف فورًا دون تكرار المحاولات الفردية الفاشلة لكل سجل على حدة
                         break
                     }
                 } else if (validPairs.size == 1) {
@@ -582,14 +684,16 @@ object Engine {
                     failedCount++
                 } else {
                     // عزل السجلات الفاشلة فقط وحفظ السجلات السليمة في السحابة دون إعادتها لاحقًا
+                    var anySingleUploaded = false
                     for ((row, enc) in validPairs) {
                         if (!isOnline()) break
                         try {
-                            withTimeout(batchTimeoutMs) {
+                            runWithTransientRetry {
                                 uploader.upload(deviceId, listOf(enc))
                             }
                             dao.markSynced(listOf(row.id))
                             uploadedCount++
+                            anySingleUploaded = true
                         } catch (e: TimeoutCancellationException) {
                             val (summary, fix) = SyncErrorClassifier.classify(e)
                             lastFailure = summary to fix
@@ -607,7 +711,15 @@ object Engine {
                             failedCount++
                         }
                     }
+                    if (anySingleUploaded) batchesSinceCheckpoint++
                 }
+            }
+
+            if (batchesSinceCheckpoint >= 10) {
+                val checkpoint = System.currentTimeMillis()
+                runCatching { uploader.markSynced(deviceId, checkpoint) }
+                onLastSyncUpdated(checkpoint)
+                batchesSinceCheckpoint = 0
             }
         }
 
@@ -617,9 +729,14 @@ object Engine {
             onLastSyncUpdated(now)
         }
 
-        val remainingUnsynced = dao.pendingOrFailedNowForUser(uid)
+        val remainingRetryable = dao.pendingOrRetryableNowForUser(uid)
+        val totalFailedInDb = dao.pendingOrFailedNowForUser(uid)
         return when {
-            failedCount == 0 && remainingUnsynced == 0 -> {
+            failedCount == 0 && totalFailedInDb == 0 -> {
+                onErrorCleared()
+                SyncResult.Uploaded(uploadedCount)
+            }
+            stoppedForTimeBudget && failedCount == 0 && remainingRetryable > 0 -> {
                 onErrorCleared()
                 SyncResult.Uploaded(uploadedCount)
             }
@@ -629,7 +746,7 @@ object Engine {
                     "تم تأكيد السجلات المرفوعة ولن تتكرر، وستُستأنف السجلات المتبقية تلقائيًا عند عودة الاتصال.",
                 )
                 if (uploadedCount > 0) {
-                    SyncResult.PartialFailure(uploadedCount, remainingUnsynced, "انقطع الاتصال أثناء الرفع")
+                    SyncResult.PartialFailure(uploadedCount, remainingRetryable.coerceAtLeast(1), "انقطع الاتصال أثناء الرفع")
                 } else {
                     SyncResult.Offline
                 }
@@ -638,23 +755,29 @@ object Engine {
                 val (summary, fix) = lastFailure
                     ?: ("فشل رفع بعض السجلات" to "سيُعاد رفع السجلات الفاشلة فقط تلقائيًا.")
                 onErrorRecorded(summary, fix)
+                val reportedFailed = failedCount.coerceAtLeast(remainingRetryable).coerceAtLeast(1)
                 if (uploadedCount > 0) {
-                    SyncResult.PartialFailure(uploadedCount, failedCount.coerceAtLeast(remainingUnsynced), summary)
+                    SyncResult.PartialFailure(uploadedCount, reportedFailed, summary)
                 } else {
-                    SyncResult.Failed(failedCount.coerceAtLeast(remainingUnsynced), summary)
+                    SyncResult.Failed(reportedFailed, summary)
                 }
             }
         }
     }
 
     /** نقطة الدخول الرسمية للرفع في بيئة أندرويد. */
-    suspend fun upload(ctx: Context, dao: RecordDao): SyncResult = uploadMutex.withLock {
+    suspend fun upload(
+        ctx: Context,
+        dao: RecordDao,
+        maxRunDurationMs: Long = Long.MAX_VALUE,
+    ): SyncResult = uploadMutex.withLock {
         val appCtx = ctx.applicationContext
         CloudInit.configure(appCtx)
         Prefs.ensureInit(appCtx)
         if (Prefs.paused.value) return@withLock SyncResult.Paused
 
         val (activeUid, key) = Session.ensureLoaded(appCtx) ?: return@withLock SyncResult.NeedsLogin
+        applyOneTimeUploadFixRecoveryIfNeeded(appCtx, dao, activeUid)
         if (Prefs.isPrimaryOwner(activeUid)) {
             dao.claimLegacyUnownedRecords(activeUid)
         }
@@ -674,6 +797,7 @@ object Engine {
             onErrorRecorded = { summary, fix -> Prefs.recordSyncError(summary, fix) },
             onErrorCleared = { Prefs.clearSyncError() },
             onLastSyncUpdated = { now -> Prefs.setLastSync(now) },
+            maxRunDurationMs = maxRunDurationMs,
         )
     }
 }
@@ -713,8 +837,11 @@ class CaptureScanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         val dao = AppDb.get(applicationContext).dao()
         Engine.scan(applicationContext, dao)
         val uid = Engine.activeUidOrEmpty(applicationContext)
-        if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrFailedNowForUser(uid) > 0) {
-            Scheduler.enqueueImmediateUpload(applicationContext)
+        if (uid.isNotBlank()) {
+            Engine.applyOneTimeUploadFixRecoveryIfNeeded(applicationContext, dao, uid)
+            if (!Prefs.paused.value && dao.pendingOrRetryableNowForUser(uid) > 0) {
+                Scheduler.enqueueImmediateUpload(applicationContext)
+            }
         }
         return Result.success()
     }
@@ -731,8 +858,11 @@ class ContentTriggerWorker(ctx: Context, params: WorkerParameters) : CoroutineWo
             val dao = AppDb.get(applicationContext).dao()
             Engine.scan(applicationContext, dao)
             val uid = Engine.activeUidOrEmpty(applicationContext)
-            if (!Prefs.paused.value && uid.isNotBlank() && dao.pendingOrFailedNowForUser(uid) > 0) {
-                Scheduler.enqueueImmediateUpload(applicationContext)
+            if (uid.isNotBlank()) {
+                Engine.applyOneTimeUploadFixRecoveryIfNeeded(applicationContext, dao, uid)
+                if (!Prefs.paused.value && dao.pendingOrRetryableNowForUser(uid) > 0) {
+                    Scheduler.enqueueImmediateUpload(applicationContext)
+                }
             }
         } finally {
             if (Prefs.onboardingDone.value && !Prefs.paused.value) {
@@ -756,16 +886,25 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
         Prefs.syncInFlight.value = true
         try {
             val dao = AppDb.get(applicationContext).dao()
+            val uidBefore = Engine.activeUidOrEmpty(applicationContext)
+            if (uidBefore.isNotBlank()) {
+                Engine.applyOneTimeUploadFixRecoveryIfNeeded(applicationContext, dao, uidBefore)
+                if (dao.pendingOrRetryableNowForUser(uidBefore) > 50) {
+                    runCatching { setForeground(getForegroundInfo()) }
+                }
+            }
+
             Engine.scan(applicationContext, dao)
-            var result = Engine.upload(applicationContext, dao)
+            val result = Engine.upload(applicationContext, dao, maxRunDurationMs = 7 * 60_000L)
             val uid = Engine.activeUidOrEmpty(applicationContext)
             if (
                 result is SyncResult.Uploaded &&
                 uid.isNotBlank() &&
-                dao.pendingOrFailedNowForUser(uid) > 0 &&
+                dao.pendingOrRetryableNowForUser(uid) > 0 &&
                 Net.isOnline(applicationContext)
             ) {
-                result = Engine.upload(applicationContext, dao)
+                Scheduler.enqueueContinuationUpload(applicationContext)
+                return Result.success()
             }
 
             return when (result) {
@@ -794,14 +933,22 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         if (!Prefs.onboardingDone.value || Prefs.paused.value) return Result.success()
 
         val dao = AppDb.get(applicationContext).dao()
-        Engine.scan(applicationContext, dao)
         val uid = Engine.activeUidOrEmpty(applicationContext)
+        if (uid.isNotBlank()) {
+            Engine.applyOneTimeUploadFixRecoveryIfNeeded(applicationContext, dao, uid)
+        }
+        Engine.scan(applicationContext, dao)
         if (uid.isBlank()) return Result.success()
 
-        if (dao.pendingOrFailedNowForUser(uid) > 0) {
+        if (dao.pendingOrRetryableNowForUser(uid) > 0) {
             if (Net.isOnline(applicationContext)) {
-                return when (Engine.upload(applicationContext, dao)) {
-                    is SyncResult.Uploaded,
+                return when (Engine.upload(applicationContext, dao, maxRunDurationMs = 7 * 60_000L)) {
+                    is SyncResult.Uploaded -> {
+                        if (dao.pendingOrRetryableNowForUser(uid) > 0) {
+                            Scheduler.enqueueContinuationUpload(applicationContext)
+                        }
+                        Result.success()
+                    }
                     SyncResult.NothingToUpload,
                     SyncResult.NeedsLogin,
                     SyncResult.Paused -> Result.success()
@@ -931,6 +1078,21 @@ object Scheduler {
 
         WorkManager.getInstance(appCtx)
             .enqueueUniqueWork(WORK_UPLOAD_QUEUE, policy, builder.build())
+    }
+
+    /** يجدول استكمال رفع الدفعات المتبقية من قائمة كبيرة بعد انتهاء الحصة الزمنية الآمنة للدفعة الحالية. */
+    fun enqueueContinuationUpload(ctx: Context) {
+        val appCtx = ctx.applicationContext
+        Prefs.ensureInit(appCtx)
+        if (Prefs.paused.value) return
+
+        val req = OneTimeWorkRequestBuilder<UploadWorker>()
+            .setConstraints(connectedConstraint)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+
+        WorkManager.getInstance(appCtx)
+            .enqueueUniqueWork(WORK_UPLOAD_QUEUE, ExistingWorkPolicy.APPEND_OR_REPLACE, req)
     }
 
     /** فحص محلي فوري يتبعه رفع تلقائي (مثلاً بعد منح الصلاحيات أو اكتمال الإعداد الأول). */

@@ -220,6 +220,9 @@ object UsernameAuth {
                     repo.createCrypto(validPw.toCharArray())
                 }
             } else {
+                if (auth.currentUser != null) {
+                    runCatching { auth.signOut() }
+                }
                 resolvedUid = withContext(Dispatchers.Default) {
                     Crypto.deriveCapabilityUid(norm.usernameId, validPw)
                 }
@@ -274,18 +277,42 @@ object UsernameAuth {
                 }
                 resolvedName = repo.getCurrentUsername() ?: norm.username
             } else {
-                resolvedUid = withContext(Dispatchers.Default) {
+                if (auth.currentUser != null) {
+                    runCatching { auth.signOut() }
+                }
+                val capUid = withContext(Dispatchers.Default) {
                     Crypto.deriveCapabilityUid(norm.usernameId, validPw)
                 }
-                val repo = CloudRepo(auth = auth, explicitUid = resolvedUid)
-                val storedUsername = repo.lookupCapabilityAccountUsername()
-                    ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
-                resolvedName = storedUsername
-                key = if (repo.hasCrypto()) {
-                    repo.unlock(validPw.toCharArray())
-                        ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                val capRepo = CloudRepo(auth = auth, explicitUid = capUid)
+                val storedUsername = capRepo.lookupCapabilityAccountUsername()
+                if (storedUsername != null) {
+                    resolvedUid = capUid
+                    resolvedName = storedUsername
+                    key = if (capRepo.hasCrypto()) {
+                        capRepo.unlock(validPw.toCharArray())
+                            ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                    } else {
+                        capRepo.createCrypto(validPw.toCharArray())
+                    }
                 } else {
-                    repo.createCrypto(validPw.toCharArray())
+                    // مسار احتياطي للحسابات الأقدم المسجّلة عبر Firebase Email/Password قبل الانتقال لحسابات القدرة
+                    val legacyCred = runCatching {
+                        auth.signInWithEmailAndPassword(norm.syntheticEmail, validPw).await()
+                    }.getOrNull()
+                    val legacyUid = legacyCred?.user?.uid
+                        ?: throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                    resolvedUid = legacyUid
+                    val legacyRepo = CloudRepo(auth = auth, explicitUid = legacyUid)
+                    legacyRepo.ensureUserProfile(norm, isNewRegistration = false)
+                    key = if (legacyRepo.hasCrypto()) {
+                        legacyRepo.unlock(validPw.toCharArray()) ?: run {
+                            auth.signOut()
+                            throw UsernameAuthException("اسم المستخدم أو كلمة المرور غير صحيحة.")
+                        }
+                    } else {
+                        legacyRepo.createCrypto(validPw.toCharArray())
+                    }
+                    resolvedName = legacyRepo.getCurrentUsername() ?: norm.username
                 }
             }
 

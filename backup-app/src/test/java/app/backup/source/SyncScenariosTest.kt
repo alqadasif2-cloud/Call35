@@ -614,6 +614,120 @@ class SyncScenariosTest {
         assertFalse(ClipboardPolicy.canAutoReadInBackground(29)) // Android 10
         assertFalse(ClipboardPolicy.canAutoReadInBackground(34)) // Android 14
     }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 13: استعادة آلاف السجلات الفاشلة بعد إصلاح الرفع ورفعها بدفعات 50 دون تكرار أو فقدان
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario13_upgradeRecoveryResetsFailedBacklog_andUploadsInBatchesOf50WithCheckpoints() = runBlocking {
+        val dao = InMemoryRecordDao()
+        val cloud = FakeCloudUploader()
+        val baseTs = 1_720_000_000_000L
+
+        // محاكاة قاعدة بيانات متراكمة بها 260 سجل FAILED (بأخطاء قديمة وattemptCount=3) + 15 LOCAL_ONLY
+        val backlog = ArrayList<RecordEntity>(275)
+        for (i in 1..260) {
+            val rec = Rec.call(devA, "050000${i.toString().padStart(4, '0')}", baseTs + i * 1000L, "incoming", 12L, null)
+            backlog += RecordEntity(
+                id = rec.id,
+                type = rec.type.id,
+                ts = rec.ts,
+                json = rec.fields.toString(),
+                syncState = SyncState.FAILED,
+                createdAt = baseTs,
+                ownerUid = userA,
+                attemptCount = 3,
+                lastError = "PERMISSION_DENIED (legacy whereIn)",
+                updatedAt = baseTs,
+            )
+        }
+        for (i in 261..275) {
+            val rec = Rec.sms(devA, "055000$i", "رسالة محلية $i", baseTs + i * 1000L, "inbox")
+            backlog += RecordEntity(
+                id = rec.id,
+                type = rec.type.id,
+                ts = rec.ts,
+                json = rec.fields.toString(),
+                syncState = SyncState.LOCAL_ONLY,
+                createdAt = baseTs,
+                ownerUid = userA,
+            )
+        }
+        dao.insertAll(backlog)
+
+        // تنفيذ استعادة ما بعد التحديث
+        val recovered = dao.recoverFailedForUpgrade(userA)
+        assertEquals(260, recovered)
+        assertEquals(0, dao.countByStateForUser(userA, SyncState.FAILED).first())
+        assertEquals(260, dao.countByStateForUser(userA, SyncState.PENDING).first())
+
+        val checkpointTimes = ArrayList<Long>()
+        val res = Engine.uploadRecords(
+            dao = dao,
+            uid = userA,
+            key = testVaultKey,
+            deviceId = devA,
+            deviceName = "Pixel",
+            deviceModel = "Pixel 8",
+            enabledTypes = listOf("call", "sms"),
+            uploader = cloud,
+            isOnline = { true },
+            onLastSyncUpdated = { checkpointTimes += it },
+            transientRetryDelayMs = 1L,
+        )
+
+        assertEquals(SyncResult.Uploaded(275), res)
+        assertEquals(275, dao.countByStateForUser(userA, SyncState.SYNCED).first())
+        assertEquals(0, dao.pendingOrFailedNowForUser(userA))
+        assertEquals(275, cloud.serverDocsForDevice(devA).size)
+        // 275 / 50 = 6 دفعات بحد أقصى 50 سجل لكل دفعة
+        assertTrue("يجب استخدام دفعات صغيرة <= 50", cloud.maxBatchSizeSeen <= 50)
+        assertTrue("يجب تحديث lastSyncAt الفعلي", checkpointTimes.isNotEmpty() && cloud.lastMarkedSyncAt > 0L)
+    }
+
+    // -------------------------------------------------------------------------
+    // السيناريو 14: عزل سجل غير مطابق لقواعد Firestore (توقيت تالف أو حجم زائد) دون تعطيل بقية الدفعة
+    // -------------------------------------------------------------------------
+    @Test
+    fun scenario14_singleInvalidRecordInBatch_isolatedLocallyWithoutFailingValidRecords() = runBlocking {
+        val dao = InMemoryRecordDao()
+        val cloud = FakeCloudUploader()
+
+        val valid1 = Rec.sms(devA, "0501111111", "رسالة صالحة 1", 1_725_000_001_000L, "inbox")
+        val valid2 = Rec.sms(devA, "0502222222", "رسالة صالحة 2", 1_725_000_002_000L, "inbox")
+        val badTsEntity = RecordEntity(
+            id = "bad_ts_record_01",
+            type = "sms",
+            ts = 0L, // غير صالح لـ firestore.rules (ts >= 1)
+            json = """{"address":"0503333333","body":"توقيت تالف","type":"inbox"}""",
+            syncState = SyncState.PENDING,
+            createdAt = 1_725_000_000_000L,
+            ownerUid = userA,
+        )
+        Engine.storeLocal(dao, listOf(valid1, valid2), uid = userA)
+        dao.insertAll(listOf(badTsEntity))
+
+        val res = Engine.uploadRecords(
+            dao = dao,
+            uid = userA,
+            key = testVaultKey,
+            deviceId = devA,
+            deviceName = "Pixel",
+            deviceModel = "Pixel 8",
+            enabledTypes = listOf("sms"),
+            uploader = cloud,
+            isOnline = { true },
+            transientRetryDelayMs = 1L,
+        )
+
+        assertTrue(res is SyncResult.PartialFailure)
+        val pf = res as SyncResult.PartialFailure
+        assertEquals(2, pf.uploadedCount)
+        assertEquals(1, pf.failedCount)
+        assertEquals(2, dao.countByStateForUser(userA, SyncState.SYNCED).first())
+        assertEquals(1, dao.countByStateForUser(userA, SyncState.FAILED).first())
+        assertEquals(2, cloud.serverDocsForDevice(devA).size)
+    }
 }
 
 /** تنفيذ محلي مطابق لـ Room RecordDao لأغراض الاختبار الفوري الحتمي على JVM. */
@@ -665,13 +779,13 @@ private class InMemoryRecordDao : RecordDao {
 
     override suspend fun pendingForUser(uid: String, n: Int): List<RecordEntity> =
         rows.values
-            .filter { it.ownerUid == uid && (it.syncState == SyncState.PENDING || it.syncState == SyncState.FAILED) }
+            .filter { it.ownerUid == uid && (it.syncState == SyncState.PENDING || (it.syncState == SyncState.FAILED && it.attemptCount < 5)) }
             .sortedBy { it.ts }
             .take(n)
 
     override suspend fun pending(n: Int): List<RecordEntity> =
         rows.values
-            .filter { it.syncState == SyncState.PENDING || it.syncState == SyncState.FAILED }
+            .filter { it.syncState == SyncState.PENDING || (it.syncState == SyncState.FAILED && it.attemptCount < 5) }
             .sortedBy { it.ts }
             .take(n)
 
@@ -702,7 +816,7 @@ private class InMemoryRecordDao : RecordDao {
     override suspend fun resetSyncForUser(uid: String, now: Long) {
         for ((k, v) in rows.entries) {
             if (v.ownerUid == uid) {
-                rows[k] = v.copy(syncState = SyncState.PENDING, lastError = null, updatedAt = now)
+                rows[k] = v.copy(syncState = SyncState.PENDING, attemptCount = 0, lastError = null, updatedAt = now)
             }
         }
         emit()
@@ -710,7 +824,7 @@ private class InMemoryRecordDao : RecordDao {
 
     override suspend fun resetSync() {
         for ((k, v) in rows.entries) {
-            rows[k] = v.copy(syncState = SyncState.PENDING, lastError = null)
+            rows[k] = v.copy(syncState = SyncState.PENDING, attemptCount = 0, lastError = null)
         }
         emit()
     }
@@ -719,13 +833,15 @@ private class InMemoryRecordDao : RecordDao {
         var c = 0
         for ((k, v) in rows.entries) {
             if (v.ownerUid == uid && v.syncState == SyncState.FAILED) {
-                rows[k] = v.copy(syncState = SyncState.PENDING, updatedAt = now)
+                rows[k] = v.copy(syncState = SyncState.PENDING, attemptCount = 0, lastError = null, updatedAt = now)
                 c++
             }
         }
         if (c > 0) emit()
         return c
     }
+
+    override suspend fun recoverFailedForUpgrade(uid: String, now: Long): Int = retryFailedNow(uid, now)
 
     override fun total(): Flow<Int> = state.map { it.size }
 
@@ -752,6 +868,11 @@ private class InMemoryRecordDao : RecordDao {
     override suspend fun pendingOrFailedNowForUser(uid: String): Int =
         rows.values.count {
             it.ownerUid == uid && (it.syncState == SyncState.PENDING || it.syncState == SyncState.FAILED)
+        }
+
+    override suspend fun pendingOrRetryableNowForUser(uid: String): Int =
+        rows.values.count {
+            it.ownerUid == uid && (it.syncState == SyncState.PENDING || (it.syncState == SyncState.FAILED && it.attemptCount < 5))
         }
 
     override suspend fun pendingNow(): Int =
@@ -796,6 +917,7 @@ private class FakeCloudUploader : CloudUploader {
     val uploadedRecordIdsHistory = ArrayList<String>()
     var uploadCallCount = 0
     var totalRecordsUploadedInCalls = 0
+    var maxBatchSizeSeen = 0
     var lastMarkedSyncAt = 0L
     var sessionValidationState: app.backup.core.AuthSessionState = app.backup.core.AuthSessionState.Valid
     var failBatchWithPermissionDenied = false
@@ -810,6 +932,7 @@ private class FakeCloudUploader : CloudUploader {
 
     override suspend fun upload(deviceId: String, recs: List<EncRecord>) {
         uploadCallCount++
+        if (recs.size > maxBatchSizeSeen) maxBatchSizeSeen = recs.size
         if (failBatchWithPermissionDenied) {
             throw com.google.firebase.firestore.FirebaseFirestoreException(
                 "رفضت قواعد أمان Firebase حفظ الدفعة",

@@ -1,9 +1,8 @@
-import { deleteUser, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
+import { deleteUser, EmailAuthProvider, reauthenticateWithCredential, signOut as firebaseSignOut } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
   doc,
-  documentId,
   getDoc,
   getDocFromServer,
   getDocs,
@@ -57,6 +56,37 @@ function requireUid(explicitUid?: string): string {
 function assertValidId(id: string, label: string): void {
   if (!id || id.length > BLUEPRINT_LIMITS.ID_MAX_LEN || !BLUEPRINT_LIMITS.ID_PATTERN.test(id)) {
     throw new Error(`معرّف غير صالح (${label}).`);
+  }
+}
+
+export function isVaultCapabilityId(uid: string): boolean {
+  return uid.length === 50 && uid.startsWith('v_') && /^v_[0-9a-f]{48}$/.test(uid);
+}
+
+async function ensureCapabilityAuthClean(uid: string): Promise<void> {
+  if (isVaultCapabilityId(uid) && auth.currentUser) {
+    try {
+      await firebaseSignOut(auth);
+    } catch {
+      // Best-effort signOut
+    }
+  }
+}
+
+function validateRecordForUpload(rec: EncRecord): void {
+  assertValidId(rec.id, 'recId');
+  if (!BLUEPRINT_LIMITS.ALLOWED_TYPES.includes(rec.type)) {
+    throw new Error(`نوع السجل غير مدعوم (${String(rec.type)}).`);
+  }
+  const ts = Math.trunc(rec.ts);
+  if (!Number.isFinite(ts) || ts < 1 || ts > 9_999_999_999_999) {
+    throw new Error(`توقيت السجل خارج النطاق المسموح (${rec.ts}).`);
+  }
+  if (!rec.iv || rec.iv.length < 12 || rec.iv.length > BLUEPRINT_LIMITS.IV_MAX_LEN) {
+    throw new Error('طول متجه التشفير (IV) غير صالح.');
+  }
+  if (!rec.data || rec.data.length < 16 || rec.data.length > BLUEPRINT_LIMITS.CIPHERTEXT_MAX_LEN) {
+    throw new Error('حجم السجل المشفّر غير صالح أو يتجاوز الحد الأقصى المسموح به.');
   }
 }
 
@@ -546,7 +576,8 @@ export const CloudRepo = {
 
   /**
    * Uploads encrypted records in atomic batches (<= 400).
-   * Preserves deterministic ID deduplication and respects immutable createdAt on re-uploads.
+   * Optimistically writes new records without pre-reads (avoiding forbidden whereIn(documentId) queries),
+   * and falls back to per-document `getDoc` (`allow get`) only when updating pre-existing IDs.
    */
   async uploadBatch(deviceId: string, records: EncRecord[]): Promise<void> {
     if (records.length === 0) return;
@@ -556,64 +587,85 @@ export const CloudRepo = {
 
     const uid = requireUid();
     assertValidId(deviceId, 'deviceId');
+    await ensureCapabilityAuthClean(uid);
     const basePath = `users/${uid}/devices/${deviceId}/records`;
 
     const uniqueRecords = Array.from(new Map(records.map((r) => [r.id, r])).values());
     for (const rec of uniqueRecords) {
-      assertValidId(rec.id, 'recId');
-      if (rec.data.length > BLUEPRINT_LIMITS.CIPHERTEXT_MAX_LEN) {
-        throw new Error('حجم السجل المشفّر يتجاوز الحد الأقصى المسموح به.');
-      }
+      validateRecordForUpload(rec);
     }
 
-    const existingIds = new Set<string>();
-    try {
-      for (let i = 0; i < uniqueRecords.length; i += 30) {
-        const idChunk = uniqueRecords.slice(i, i + 30).map((r) => r.id);
-        const q = query(
-          collection(db, 'users', uid, 'devices', deviceId, 'records'),
-          where('ownerId', '==', uid),
-          where(documentId(), 'in', idChunk)
-        );
-        const snap = await getDocs(q);
-        snap.docs.forEach((d) => existingIds.add(d.id));
+    const commitWithExisting = async (existingIds: Set<string>): Promise<void> => {
+      const batch = writeBatch(db);
+      for (const rec of uniqueRecords) {
+        const ref = doc(db, 'users', uid, 'devices', deviceId, 'records', rec.id);
+        if (existingIds.has(rec.id)) {
+          batch.update(ref, {
+            iv: rec.iv,
+            data: rec.data,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          batch.set(ref, {
+            ownerId: uid,
+            deviceId,
+            type: rec.type,
+            ts: Math.trunc(rec.ts),
+            iv: rec.iv,
+            data: rec.data,
+            v: 1,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
       }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, basePath);
-    }
-
-    const batch = writeBatch(db);
-    for (const rec of uniqueRecords) {
-      assertValidId(rec.id, 'recId');
-      if (rec.data.length > BLUEPRINT_LIMITS.CIPHERTEXT_MAX_LEN) {
-        throw new Error('حجم السجل المشفّر يتجاوز الحد الأقصى المسموح به.');
-      }
-      const ref = doc(db, 'users', uid, 'devices', deviceId, 'records', rec.id);
-      if (existingIds.has(rec.id)) {
-        batch.update(ref, {
-          iv: rec.iv,
-          data: rec.data,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        batch.set(ref, {
-          ownerId: uid,
-          deviceId,
-          type: rec.type,
-          ts: Math.trunc(rec.ts),
-          iv: rec.iv,
-          data: rec.data,
-          v: 1,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-    }
-
-    try {
       await batch.commit();
+    };
+
+    try {
+      await commitWithExisting(new Set());
+      return;
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, basePath);
+      const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+      const isConflictOrRules =
+        msg.includes('permission-denied') ||
+        msg.includes('missing or insufficient permissions') ||
+        msg.includes('already-exists');
+      if (!isConflictOrRules) {
+        handleFirestoreError(error, OperationType.WRITE, basePath);
+      }
+
+      if (!isVaultCapabilityId(uid) && (!auth.currentUser || auth.currentUser.uid !== uid)) {
+        handleFirestoreError(error, OperationType.WRITE, basePath);
+      }
+
+      const existingIds = new Set<string>();
+      try {
+        for (let i = 0; i < uniqueRecords.length; i += 25) {
+          const slice = uniqueRecords.slice(i, i + 25);
+          const snaps = await Promise.all(
+            slice.map(async (rec) => ({
+              id: rec.id,
+              snap: await getDoc(doc(db, 'users', uid, 'devices', deviceId, 'records', rec.id)),
+            }))
+          );
+          for (const item of snaps) {
+            if (item.snap.exists()) existingIds.add(item.id);
+          }
+        }
+      } catch (readErr) {
+        handleFirestoreError(readErr, OperationType.GET, basePath);
+      }
+
+      if (existingIds.size === 0) {
+        handleFirestoreError(error, OperationType.WRITE, basePath);
+      }
+
+      try {
+        await commitWithExisting(existingIds);
+      } catch (retryErr) {
+        handleFirestoreError(retryErr, OperationType.WRITE, basePath);
+      }
     }
   },
 

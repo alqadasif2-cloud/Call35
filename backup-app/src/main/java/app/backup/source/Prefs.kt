@@ -179,6 +179,15 @@ object Prefs {
             sp.edit().putString("lastClipHash", value).apply()
         }
 
+    fun isUploadFixRecoveryApplied(uid: String): Boolean =
+        uid.isNotBlank() && sp.getBoolean("upload_fix_recovery_v3_$uid", false)
+
+    fun markUploadFixRecoveryApplied(uid: String) {
+        if (uid.isNotBlank()) {
+            sp.edit().putBoolean("upload_fix_recovery_v3_$uid", true).apply()
+        }
+    }
+
     fun completeOnboarding(name: String, types: Set<String>) {
         val cleanName = name.trim().ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}" }.take(100)
         sp.edit()

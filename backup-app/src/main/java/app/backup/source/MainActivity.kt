@@ -275,10 +275,13 @@ fun Home() {
     var confirm by remember { mutableStateOf<String?>(null) }
     var pendingToggleType by remember { mutableStateOf<RecordType?>(null) }
 
-    // ربط سجلات الإصدار القديم بالحساب الأساسي لمرة واحدة وتأكيد الجدولة الخلفية دون إخفاء أي أخطاء مزامنة سابقة
+    // ربط سجلات الإصدار القديم بالحساب الأساسي واستعادة السجلات الفاشلة لمرة واحدة بعد إصلاح مسار الرفع دون فقدان أي سجل
     LaunchedEffect(activeUid) {
-        if (activeUid.isNotBlank() && Prefs.isPrimaryOwner(activeUid)) {
-            dao.claimLegacyUnownedRecords(uid = activeUid)
+        if (activeUid.isNotBlank()) {
+            if (Prefs.isPrimaryOwner(activeUid)) {
+                dao.claimLegacyUnownedRecords(uid = activeUid)
+            }
+            Engine.applyOneTimeUploadFixRecoveryIfNeeded(ctx, dao, activeUid)
         }
         Scheduler.ensureBackgroundSchedule(ctx)
         if (!paused && activeUid.isNotBlank()) {
@@ -393,7 +396,7 @@ fun Home() {
         }
     }
 
-    val waitingCount = pendingCount + failedCount
+    val waitingCount = pendingCount + failedCount + (if (!paused) localOnlyCount else 0)
     val overallStatus = when {
         paused -> "متوقف مؤقتًا بأمر المستخدم"
         syncInFlight -> "جاري تشفير ورفع السجلات إلى Firebase..."
@@ -452,6 +455,38 @@ fun Home() {
                 notice?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        if (paused) {
+            Spacer(Modifier.height(10.dp))
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp)) {
+                    Text(
+                        "المزامنة السحابية متوقفة مؤقتًا",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "تُحفظ السجلات الجديدة محليًا فقط ($localOnlyCount سجل) ولن تُرفع إلى Firebase حتى تستأنف المزامنة.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = {
+                        Prefs.setPaused(false)
+                        scope.launch {
+                            dao.promoteLocalToPending(activeUid)
+                            Engine.applyOneTimeUploadFixRecoveryIfNeeded(ctx, dao, activeUid)
+                            Prefs.clearSyncError()
+                            Scheduler.ensureBackgroundSchedule(ctx)
+                            Scheduler.triggerImmediateScanAndUpload(ctx)
+                            message = "تم استئناف المراقبة الخلفية والمزامنة التلقائية."
+                        }
+                    }) {
+                        Text("استئناف المزامنة ورفع المحفوظ محليًا")
+                    }
                 }
             }
         }
@@ -522,6 +557,8 @@ fun Home() {
                 enabled = !paused && !syncInFlight,
                 onClick = {
                     scope.launch {
+                        dao.promoteLocalToPending(activeUid)
+                        dao.retryFailedNow(activeUid)
                         val added = Engine.scan(ctx, dao)
                         val unsyncedNow = dao.pendingOrFailedNowForUser(activeUid)
                         if (unsyncedNow == 0) {
@@ -534,6 +571,7 @@ fun Home() {
                             Scheduler.enqueueImmediateUpload(ctx, expedited = false)
                             message = "تم حفظ السجلات محليًا ($unsyncedNow بانتظار الرفع)؛ ستُرفع تلقائيًا فور توفر الإنترنت."
                         } else {
+                            Prefs.clearSyncError()
                             Scheduler.syncNow(ctx)
                             message = "بدأت مزامنة $unsyncedNow سجل مع السحابة..."
                         }
@@ -548,6 +586,7 @@ fun Home() {
                     Prefs.setPaused(false)
                     scope.launch {
                         dao.promoteLocalToPending(activeUid)
+                        Engine.applyOneTimeUploadFixRecoveryIfNeeded(ctx, dao, activeUid)
                         Scheduler.ensureBackgroundSchedule(ctx)
                         Scheduler.triggerImmediateScanAndUpload(ctx)
                         message = "تم استئناف المراقبة الخلفية والمزامنة التلقائية."
@@ -787,7 +826,11 @@ fun Home() {
         if (waitingCount > 0) {
             ActionButton("إعادة محاولة رفع السجلات المعلّقة والفاشلة ($waitingCount)") {
                 scope.launch {
+                    if (paused) Prefs.setPaused(false)
+                    dao.promoteLocalToPending(activeUid)
                     dao.retryFailedNow(activeUid)
+                    Prefs.clearSyncError()
+                    Scheduler.ensureBackgroundSchedule(ctx)
                     Scheduler.syncNow(ctx)
                     message = "بدأت إعادة محاولة رفع السجلات غير المتزامنة فقط."
                 }

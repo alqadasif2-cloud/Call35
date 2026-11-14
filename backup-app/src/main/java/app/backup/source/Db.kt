@@ -76,12 +76,12 @@ interface RecordDao {
     @Query("UPDATE records SET syncState = 0, updatedAt = :now WHERE ownerUid = :uid AND syncState = 3")
     suspend fun promoteLocalToPending(uid: String, now: Long = System.currentTimeMillis()): Int
 
-    /** السجلات التي تحتاج رفعًا فعليًا (بانتظار الرفع = 0 أو فشل الرفع سابقًا = 2) مرتّبة زمنيًا. */
-    @Query("SELECT * FROM records WHERE ownerUid = :uid AND syncState IN (0, 2) ORDER BY ts ASC LIMIT :n")
+    /** السجلات التي تحتاج رفعًا فعليًا (بانتظار الرفع = 0 أو فشل الرفع سابقًا مع أقل من 5 محاولات آلية) مرتّبة زمنيًا. */
+    @Query("SELECT * FROM records WHERE ownerUid = :uid AND (syncState = 0 OR (syncState = 2 AND attemptCount < 5)) ORDER BY ts ASC LIMIT :n")
     suspend fun pendingForUser(uid: String, n: Int): List<RecordEntity>
 
     /** توافق مع الاستدعاءات والاختبارات المباشرة عندما لا يُحدَّد حساب. */
-    @Query("SELECT * FROM records WHERE syncState IN (0, 2) ORDER BY ts ASC LIMIT :n")
+    @Query("SELECT * FROM records WHERE (syncState = 0 OR (syncState = 2 AND attemptCount < 5)) ORDER BY ts ASC LIMIT :n")
     suspend fun pending(n: Int): List<RecordEntity>
 
     @Query("UPDATE records SET syncState = 1, lastError = NULL, updatedAt = :now WHERE id IN (:ids)")
@@ -93,14 +93,18 @@ interface RecordDao {
     )
     suspend fun markFailed(ids: List<String>, reason: String, now: Long = System.currentTimeMillis())
 
-    @Query("UPDATE records SET syncState = 0, lastError = NULL, updatedAt = :now WHERE ownerUid = :uid")
+    @Query("UPDATE records SET syncState = 0, attemptCount = 0, lastError = NULL, updatedAt = :now WHERE ownerUid = :uid")
     suspend fun resetSyncForUser(uid: String, now: Long = System.currentTimeMillis())
 
-    @Query("UPDATE records SET syncState = 0, lastError = NULL")
+    @Query("UPDATE records SET syncState = 0, attemptCount = 0, lastError = NULL")
     suspend fun resetSync()
 
-    @Query("UPDATE records SET syncState = 0, updatedAt = :now WHERE ownerUid = :uid AND syncState = 2")
+    @Query("UPDATE records SET syncState = 0, attemptCount = 0, lastError = NULL, updatedAt = :now WHERE ownerUid = :uid AND syncState = 2")
     suspend fun retryFailedNow(uid: String, now: Long = System.currentTimeMillis()): Int
+
+    /** استعادة لمرة واحدة بعد إصلاح مسار الرفع: يعيد كل السجلات الفاشلة سابقًا إلى PENDING دون حذف أي سجل. */
+    @Query("UPDATE records SET syncState = 0, attemptCount = 0, lastError = NULL, updatedAt = :now WHERE ownerUid = :uid AND syncState = 2")
+    suspend fun recoverFailedForUpgrade(uid: String, now: Long = System.currentTimeMillis()): Int
 
     @Query("SELECT COUNT(*) FROM records")
     fun total(): Flow<Int>
@@ -122,6 +126,9 @@ interface RecordDao {
 
     @Query("SELECT COUNT(*) FROM records WHERE ownerUid = :uid AND syncState IN (0, 2)")
     suspend fun pendingOrFailedNowForUser(uid: String): Int
+
+    @Query("SELECT COUNT(*) FROM records WHERE ownerUid = :uid AND (syncState = 0 OR (syncState = 2 AND attemptCount < 5))")
+    suspend fun pendingOrRetryableNowForUser(uid: String): Int
 
     @Query("SELECT COUNT(*) FROM records WHERE syncState IN (0, 2)")
     suspend fun pendingNow(): Int
